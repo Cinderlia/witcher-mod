@@ -1,0 +1,15 @@
+{
+  "GET http://127.0.0.1/test/code/config.php ": {
+    "_id": 1,
+    "_urlstr": "http://127.0.0.1/test/code/config.php",
+    "_url": "http://127.0.0.1/test/code/config.php",
+    "_resourceType": "document",
+    "_method": "GET",
+    "_postData": "",
+    "_headers": {},
+    "attempts": 0,
+    "processed": 0,
+    "from": "initialCodeScan",
+    "key": "GET http://127.0.0.1/test/code/config.php "
+  }
+}

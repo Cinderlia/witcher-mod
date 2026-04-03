@@ -1,0 +1,8 @@
+http://127.0.0.1/test/code/config.php
+http://127.0.0.1/test/code/test-2.php
+http://127.0.0.1/test/code/test-5-cmd.php
+http://127.0.0.1/test/code/test-cookie-5.php
+http://127.0.0.1/test/code/test-equal-1.php
+http://127.0.0.1/test/code/test-findvar-1.php
+http://127.0.0.1/test/code/test-get-5-crosspol.php
+http://127.0.0.1/test/code/test-select-3.php

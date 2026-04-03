@@ -1,0 +1,8 @@
+code/config.php
+code/test-2.php
+code/test-5-cmd.php
+code/test-cookie-5.php
+code/test-equal-1.php
+code/test-findvar-1.php
+code/test-get-5-crosspol.php
+code/test-select-3.php
