@@ -3,6 +3,8 @@ import os
 import re
 import shutil
 from typing import List, Dict, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 from ..core.config import XSSConfig
 from ..core.seed_parser import SeedParser
@@ -20,18 +22,32 @@ class XSSSeedGenerator:
         self.mutator = SeedMutator()
         self.payloads = PayloadFactory(XSSConfig(seed_dir=work_dir, output_dir=work_dir))
         self.deduper = SeedDeduper()
+        self._dedupe_lock = threading.Lock()
+        self._log_lock = threading.Lock()
 
     def run(self) -> Dict[str, int]:
+        fuzzer_dirs = self._fuzzer_dirs()
         total_seeds = 0
         total_generated = 0
-        for fuzzer_dir in self._fuzzer_dirs():
+
+        def one(fuzzer_dir: str):
             queue_dir = os.path.join(fuzzer_dir, "queue")
             if not os.path.isdir(queue_dir):
-                continue
+                return 0, 0
             seed_files = self._queue_files(queue_dir)
-            total_seeds += len(seed_files)
             generated = self._process_queue(queue_dir, seed_files)
-            total_generated += generated
+            return len(seed_files), generated
+
+        max_workers = max(1, min(len(fuzzer_dirs), os.cpu_count() or 4))
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futs = [ex.submit(one, fd) for fd in (fuzzer_dirs or [])]
+            for fu in as_completed(futs):
+                try:
+                    scanned, gen = fu.result()
+                except Exception:
+                    continue
+                total_seeds += int(scanned)
+                total_generated += int(gen)
         self._log(f"Witcher-XSS seeds generated={total_generated} in {self.output_dir_name}")
         return {"seeds_scanned": total_seeds, "seeds_generated": total_generated}
 
@@ -55,8 +71,9 @@ class XSSSeedGenerator:
             for param in params:
                 payload = self.payloads.random_payload(param)
                 mutated = self.mutator.replace_param(seed_input, param, payload.value)
-                if self.deduper.is_duplicate(mutated):
-                    continue
+                with self._dedupe_lock:
+                    if self.deduper.is_duplicate(mutated):
+                        continue
                 name = self._seed_name(seed_path, param.location, param.index, payload.token)
                 out_path = os.path.join(seed_output_dir, name)
                 with open(out_path, "wb") as wf:
@@ -105,7 +122,7 @@ class XSSSeedGenerator:
     def _fuzzer_dirs(self) -> List[str]:
         items = []
         for name in sorted(os.listdir(self.work_dir)):
-            if name == "fuzzer-master" or name.startswith("fuzzer-"):
+            if name == "fuzzer-master" or (name.startswith("fuzzer-") and name != "extsync"):
                 path = os.path.join(self.work_dir, name)
                 if os.path.isdir(path):
                     items.append(path)
@@ -113,8 +130,9 @@ class XSSSeedGenerator:
 
     def _log(self, message: str) -> None:
         print(f"[Witcher-XSS] {message}")
-        with open(self.log_path, "a", encoding="utf-8") as wf:
-            wf.write(message + "\n")
+        with self._log_lock:
+            with open(self.log_path, "a", encoding="utf-8") as wf:
+                wf.write(message + "\n")
 
 
 def generate_xss_seeds(work_dir: str, output_dir_name: str = "xss_queue") -> Dict[str, int]:

@@ -131,7 +131,7 @@ def main():
     fuzzer.start()
     start_time = time.time()
 
-    reporter = Reporter(args.binary, args.reportdir, args.afl_cores, args.first_crash, args.timeout, fuzzer.work_dir )
+    reporter = Reporter(args.binary, args.reportdir, args.afl_cores, args.first_crash, args.timeout, fuzzer.work_dir, fuzzer=fuzzer)
 
     reporter.start()
 

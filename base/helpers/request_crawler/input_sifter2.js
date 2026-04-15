@@ -9,6 +9,7 @@ import process from 'process';
 import fuzzySet from 'fuzzyset';
 //const {JSHandle} = require('puppeteer/lib');
 import {FoundRequest} from './FoundRequest.js';
+import {fileURLToPath} from 'url';
 
 import{ networkInterfaces } from 'os';
 
@@ -21,6 +22,10 @@ const SEED_SLICE_QUOTA = 1;
 const TOTAL_SLICE_QUOTA = MAIN_SLICE_QUOTA + SEED_SLICE_QUOTA;
 
 let SIGINT_HANDLER_INSTALLED = false;
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const GREMLINS_LOCAL_PATH = path.join(__dirname, "gremlins.min.js");
 
 // var requestsFound = {}; // { <method+url>: {url:"", method:"", postData:"", attempts:0 } }
 function sleepg(ms) {
@@ -64,12 +69,28 @@ export class AppData{
         if (!this.meta || !this.meta.hasOwnProperty("init")){
             this.meta = {init:{}};
         }
-        if (!this.meta.init || this.meta.init["crawler_default"] !== true){
+        let totalQueued = this.reqCount + this.seedCount;
+        let startupLine = `[WC][DEBUG] AppData after load: main=${this.reqCount} seed=${this.seedCount} currentRound=${this.currentURLRound} seedRound=${this.seedURLRound}`;
+        console.log(startupLine);
+        this._startupLog(startupLine);
+        if (!this.meta.init || this.meta.init["crawler_default"] !== true || totalQueued === 0){
             this._performCrawlerDefaultInit();
             if (this.meta && this.meta.init){
                 this.meta.init["crawler_default"] = true;
             }
             this.save();
+            let initLine = `[WC][DEBUG] AppData default init complete: main=${this.reqCount} seed=${this.seedCount}`;
+            console.log(initLine);
+            this._startupLog(initLine);
+        }
+    }
+
+    _startupLog(msg){
+        try{
+            let fn = path.join(this.base_appdir, "crawler_startup.log");
+            let line = `[${(new Date()).toISOString()}] ${msg}\n`;
+            fs.appendFileSync(fn, line, {encoding:"utf8"});
+        } catch(ex){
         }
     }
 
@@ -77,10 +98,17 @@ export class AppData{
         /**
          * Adding extra guessed urls here.
          */
-        if (this.site_url.href.endsWith("/")){
-            this.addRequest(FoundRequest.requestParamFactory(`${this.site_url.href}/admin`, "GET", "",{},"initial",this.site_url.href))
+        try{
+            let baseHref = this.site_url.href;
+            let adminHref = (new URL("admin", baseHref)).href;
+            this.addRequest(FoundRequest.requestParamFactory(adminHref, "GET", "",{},"initial",baseHref))
+            this.addRequest(FoundRequest.requestParamFactory(baseHref, "GET", "",{},"initial",baseHref))
+        } catch(ex){
+            if (this.site_url.href.endsWith("/")){
+                this.addRequest(FoundRequest.requestParamFactory(`${this.site_url.href}/admin`, "GET", "",{},"initial",this.site_url.href))
+            }
+            this.addRequest(FoundRequest.requestParamFactory(`${this.site_url.href}`, "GET", "",{},"initial",this.site_url.href))
         }
-        this.addRequest(FoundRequest.requestParamFactory(`${this.site_url.href}`, "GET", "",{},"initial",this.site_url.href))
         this.seedLocalPhpFiles();
         this.updateReqsFromExternal();
     }
@@ -226,18 +254,33 @@ export class AppData{
             let keys = Object.keys(temprf);
             console.log(`[WC][DEBUG] loadReqsFromJSON: loaded=${keys.length} file=${json_fn}`);
             let preview = keys.length <= 50;
-            let previewKeys = preview ? keys : keys.slice(0,5);
-            for (let key of previewKeys){
+            let previewLimit = 5;
+            let printed = 0;
+            for (let key of keys){
                 let req = temprf[key];
-                this.currentURLRound = Math.min(this.currentURLRound, req["attempts"]);
+                let att = 0;
+                if (req && typeof req === "object" && req.hasOwnProperty("attempts")){
+                    att = req["attempts"];
+                }
+                if (typeof att !== "number" || Number.isNaN(att)){
+                    att = 0;
+                }
+                this.currentURLRound = Math.min(this.currentURLRound, att);
                 this.requestsFound[key] = Object.assign(new FoundRequest(), req);
-                if (preview){
+                if (!this.requestsFound[key].hasOwnProperty("attempts") || typeof this.requestsFound[key]["attempts"] !== "number"){
+                    this.requestsFound[key]["attempts"] = att;
+                }
+                if (!this.requestsFound[key].hasOwnProperty("processed") || typeof this.requestsFound[key]["processed"] !== "number"){
+                    this.requestsFound[key]["processed"] = 0;
+                }
+                if (preview || printed < previewLimit){
                     console.log(this.requestsFound[key].toString());
+                    printed++;
                 }
                 //this.requestsFound[key]["attempts"] = req["attempts"];
             }
-            if (!preview && keys.length > 5){
-                console.log(`[WC][DEBUG] loadReqsFromJSON: preview printed first 5 only`);
+            if (!preview && keys.length > previewLimit){
+                console.log(`[WC][DEBUG] loadReqsFromJSON: preview printed first ${previewLimit} only`);
             }
 
             let seedKeys = Object.keys(tempSeed);
@@ -245,6 +288,12 @@ export class AppData{
             for (let key of seedKeys){
                 let req = tempSeed[key];
                 this.seedRequestsFound[key] = Object.assign(new FoundRequest(), req);
+                if (!this.seedRequestsFound[key].hasOwnProperty("attempts") || typeof this.seedRequestsFound[key]["attempts"] !== "number"){
+                    this.seedRequestsFound[key]["attempts"] = 0;
+                }
+                if (!this.seedRequestsFound[key].hasOwnProperty("processed") || typeof this.seedRequestsFound[key]["processed"] !== "number"){
+                    this.seedRequestsFound[key]["processed"] = 0;
+                }
             }
             
             return true
@@ -279,10 +328,12 @@ export class AppData{
 
     getRequestInfo(){
         let outstr = "";
-        for (let value of Object.values(this.requestsFound)){
+        for (let key in this.requestsFound){
+            let value = this.requestsFound[key];
             outstr += `\x1b[38;5;28m${value.url()}, \x1b[38;5;11m${value.attempts}\x1b[0m\n`
         }
-        for (let value of Object.values(this.seedRequestsFound)){
+        for (let key in this.seedRequestsFound){
+            let value = this.seedRequestsFound[key];
             outstr += `\x1b[38;5;28m${value.url()}, \x1b[38;5;11m${value.attempts}\x1b[0m\n`
         }
         return outstr;
@@ -406,8 +457,8 @@ export class AppData{
 
         let keyMatch = 0;
 
-        let allSaved = Object.values(this.requestsFound);
-        for (let savedReq of allSaved){
+        for (let key in this.requestsFound){
+            let savedReq = this.requestsFound[key];
             let prevURL = savedReq.getURL();
             let prevPathname = savedReq.getPathname();
 
@@ -458,31 +509,16 @@ export class AppData{
         if (lowerus.startsWith("javascript")) {
             return "";
         }
-        //console.log("\x1b[38;5;3mTESTING", urlstr, "\x1b[0m", ` for parent ${parenturl.origin}`);
-
-        //if (lowerus.search(/.php($|\?)/) > -1 || lowerus.search(/.html($|\?)/) > -1 || lowerus.search("#") > -1 ) {
-
-        if (lowerus.startsWith(parenturl.origin)) {
-            //console.log("\x1b[38;5;3mValidated ", urlstr, "\x1b[0m");
-            return urlstr;
-        } else if (lowerus.startsWith("http")) {
-            //console.log("\x1b[38;5;3mFAILED TO validate ", urlstr, "\x1b[0m");
-            return "";
-        }
-
-        if (lowerus.startsWith("/")) { // absolute path
-            console.log("\x1b[38;5;3mValidated from /", parenturl.origin + urlstr, "\x1b[0m");
-            return parenturl.origin + urlstr;
-        } else { // relative path
-            let lastPathOut = ""
-            try {
-                //console.log("\x1b[38;5;3mLast choice trying to add origin and pathname to lowerus ", parenturl.origin + path.dirname(parenturl.pathname) + urlstr, "\x1b[0m");
-                lastPathOut = parenturl.origin + path.dirname(parenturl.pathname) + urlstr;
-            } catch (Exception) {
-                //console.log("\x1b[38;5;3mInvalid path WITH Last choice trying to add origin and pathname to lowerus parenturl=", parenturl, "urlstr=", urlstr, "\x1b[0m");
-                return ""
+        try{
+            if (lowerus.startsWith("http")) {
+                if (lowerus.startsWith(parenturl.origin)) {
+                    return urlstr;
+                }
+                return "";
             }
-            return parenturl.origin + path.dirname(parenturl.pathname) + urlstr;
+            return (new URL(urlstr, parenturl.href)).href;
+        } catch(ex){
+            return "";
         }
 
     }
@@ -556,7 +592,7 @@ export class AppData{
         return requestsAdded;
     }
     nextRequestId(){
-        return Object.keys(this.requestsFound).length + Object.keys(this.seedRequestsFound).length + 1
+        return this.reqCount + this.seedCount + 1;
     }
 
     //addRequest(urlstr, method, postData, headers, from="interceptedRequest", cookieData="") {
@@ -626,11 +662,23 @@ export class AppData{
     numInputsFound(){
         return this.inputSet.size;
     }
+    get reqCount() {
+        let count = 0;
+        for (let k in this.requestsFound) count++;
+        return count;
+    }
+
+    get seedCount() {
+        let count = 0;
+        for (let k in this.seedRequestsFound) count++;
+        return count;
+    }
+
     hasRequests(){
-        return Object.keys(this.requestsFound).length === 0
+        return this.reqCount === 0;
     }
     numRequestsFound(){
-        return Object.keys(this.requestsFound).length + Object.keys(this.seedRequestsFound).length
+        return this.reqCount + this.seedCount;
     }
     ignoreRequest(urlstr){
         try {
@@ -722,20 +770,18 @@ export class AppData{
             if (roundValue > MAX_NUM_ROUNDS){
                 return null;
             }
-            let randomKeys = Object.keys(store);
-            if (storeName === "main"){
-                console.log(randomKeys.slice(0,5));
-            }
             let cnt = 0;
-            for (const key of randomKeys) {
+            for (let key in store) {
                 let req = store[key];
-                cnt ++;
+                cnt++;
                 if (this.ignoreRequest(req._urlstr)){
-                    console.log(`IGNORING >>>>> ${key} `);
+                    //console.log(`IGNORING >>>>> ${key} `);
                     store[key]["attempts"] = MAX_NUM_ROUNDS
                 } else {
                     if (req["attempts"] < roundValue) {
-                        if (storeName === "main" && (cnt+5) < randomKeys.length && this.checkToSkip(req["_urlstr"])){
+                        // We skip 'checkToSkip' logic if there's no randomKeys.length equivalent,
+                        // or we could track size. Actually, this checkToSkip logic used (cnt+5) < randomKeys.length
+                        if (storeName === "main" && (cnt+5) < this.reqCount && this.checkToSkip(req["_urlstr"])){
                             continue;
                         }
                         req["attempts"] += 1;
@@ -758,15 +804,13 @@ export class AppData{
 
     save() {
         //await exerciseTarget(page, new URL(key));
-        let randomKeys = Object.keys(this.requestsFound);
-        for (const key of randomKeys) {
+        for (let key in this.requestsFound) {
             let req = this.requestsFound[key];
             if (req["_method"] === "POST"){
                 req["response_status"] = 200;
             }
         }
-        let seedKeys = Object.keys(this.seedRequestsFound);
-        for (const key of seedKeys) {
+        for (let key in this.seedRequestsFound) {
             let req = this.seedRequestsFound[key];
             if (req["_method"] === "POST"){
                 req["response_status"] = 200;
@@ -935,17 +979,21 @@ export class RequestExplorer {
             for (var i=0; i < links.length; i++) {
                 if (links[i]){
                     if (i === 0){
+                        let hc_str = "[unknown]";
+                    try {
                         let hc = await links[i].getProperty("hashCode");
-                        console.log(`[WC] check element hash = ${hc} ${typeof(links[i])}`);
+                        hc_str = hc ? String(hc) : "[null]";
+                    } catch (e) {}
+                    //console.log(`[WC] check element hash = ${hc_str}`);
                     }
                     await this.resetURLBack(page);
                     let valueHandle = null;
                     try{
                         valueHandle = await links[i].getProperty(attribute);
                     } catch(ex){
-                        console.log(`[WC] \x1b[38;5;197m link #${i}/${links.length} error encountered while trying to getProperty`, typeof(page), page.url(), tag, attribute, links[i], "\n",ex, "\x1b[0m");
+                        console.log(`[WC] \x1b[38;5;197m link #${i}/${links.length} error encountered while trying to getProperty`, typeof(page), page.url(), tag, attribute, "\n", (ex && ex.message ? ex.message : String(ex)), "\x1b[0m");
                         try {
-                            console.log("[WC] Trying again", links[i]);
+                            //console.log("[WC] Trying again", (links[i] ? typeof links[i] : "null"));
                             
                             valueHandle = await links[i].getProperty(attribute);
                         } catch (eex){
@@ -962,7 +1010,8 @@ export class RequestExplorer {
             }
 
         } catch (e){
-            console.log("[WC] error encountered while trying to search for tag", typeof(page), page.url(), tag, attribute, "\n\t", e);
+            let safeErr = e && typeof e.message === 'string' ? e.message : "Unknown Error";
+            console.log("[WC] error encountered while trying to search for tag", typeof(page), page.url(), tag, attribute, "\n\t", safeErr);
         }
         return elements;
     }
@@ -995,7 +1044,11 @@ export class RequestExplorer {
                     if (wasAdded){
                         requestsAdded++;
                         if (foundRequest.postData()){
-                            console.log(`[${GREEN}WC${ENDCOLOR}] ${GREEN} ADDED ${ENDCOLOR}${foundRequest.toString()} postData=${foundRequest.postData()} ${ENDCOLOR}`);
+                            let pd_str = foundRequest.postData();
+                            if (pd_str.length > 200) {
+                                pd_str = pd_str.substring(0, 200) + `... [truncated, total length: ${pd_str.length}]`;
+                            }
+                            console.log(`[${GREEN}WC${ENDCOLOR}] ${GREEN} ADDED ${ENDCOLOR}${foundRequest.toString()} postData=${pd_str} ${ENDCOLOR}`);
                         } else {
                             console.log(`[${GREEN}WC${ENDCOLOR}]] ${GREEN} ADDED ${ENDCOLOR}${foundRequest.toString()} \n ${ENDCOLOR}`);
                         }
@@ -1034,8 +1087,9 @@ export class RequestExplorer {
         let allParams = formInfo.getAllParams();
         
         let basedata = "";
-        for (const [pkey, pvalue] of Object.entries(allParams)) {
-            if (pkey in formInfo.multipleParamKeys) {
+        for (let pkey in allParams) {
+            let pvalue = allParams[pkey];
+            if (formInfo.multipleParamKeys.has(pkey)) {
                 continue;
             }
             let arrVal = Array.from(pvalue);
@@ -1045,15 +1099,45 @@ export class RequestExplorer {
                 basedata += `${pkey}=&`
             }
         }
+        
+        // Prevent OOM from excessively long forms
+        if (basedata.length > 5000) {
+            console.log(`[WC] Warning: Form base data is too long (${basedata.length} bytes). Truncating to prevent memory exhaustion and state explosion.`);
+            // Only take the first 5000 characters of form fields, making sure we don't break in the middle of a key
+            let truncated = basedata.substring(0, 5000);
+            let lastAmp = truncated.lastIndexOf('&');
+            if (lastAmp > 0) {
+                basedata = truncated.substring(0, lastAmp + 1);
+            }
+        }
+
         let postdata = [basedata]
+        
+        // Limit permutations to prevent combinatorial explosion which leads to OOM
+        let maxPermutations = 50;
+        let currentPermutations = 1;
+
         for (let mpk of formInfo.multipleParamKeys) {
             let new_pd = []
-            for (let ele of Array.from(allParams[mpk])){
+            let values = Array.from(allParams[mpk]);
+            
+            // Limit values per multiple param key
+            if (values.length > 5) {
+                values = values.slice(0, 5);
+            }
+
+            for (let ele of values){
                 for (let pd of postdata){
+                    if (currentPermutations * values.length > maxPermutations) {
+                        break;
+                    }
                     new_pd.push(pd + `${mpk}=${ele}&`);
                 }
             }
-            postdata = new_pd;
+            if (new_pd.length > 0) {
+                postdata = new_pd;
+                currentPermutations = postdata.length;
+            }
         }
         
         for (let pd of postdata){
@@ -1236,36 +1320,32 @@ export class RequestExplorer {
                 return new Promise(resolve => setTimeout(resolve, ms));
             }
             function getChangedDOM(domBefore, domAfter){
-                let changedDOM = {};
-                let index = 0
-                for (let dbIndex of Object.keys(domBefore)){
-                    let db = domBefore[dbIndex];
+                let changedDOM = [];
+                for (let i = 0; i < domBefore.length; i++){
+                    let db = domBefore[i];
                     let found = false;
-                    for (let da of domAfter){
-                        if (db === da){
+                    for (let j = 0; j < domAfter.length; j++){
+                        if (db === domAfter[j]){
                             found = true;
                             break;
                         }
                     }
                     if (!found){
-                        changedDOM[index] = db;
-                        index++;
+                        changedDOM.push(db);
                     }
-
                 }
                 // if domAfter larger, then add entries if not in domBefore
-                for (let daIndex=Object.keys(domBefore).length;daIndex < Object.keys(domAfter).length; daIndex++){
+                for (let daIndex = domBefore.length; daIndex < domAfter.length; daIndex++){
                     let da = domAfter[daIndex];
                     let found = false;
-                    for (let db of domBefore){
-                        if (db === da){
+                    for (let j = 0; j < domBefore.length; j++){
+                        if (domBefore[j] === da){
                             found = true;
                             break;
                         }
                     }
                     if (!found){
-                        changedDOM[index] = da;
-                        index++;
+                        changedDOM.push(da);
                     }
                 }
                 return changedDOM;
@@ -1282,8 +1362,8 @@ export class RequestExplorer {
                     console.log(`[WC] ${indent(level)} L${level} too high, skipping`);
                     return;
                 }
-                //let randomArr = shuffle(Array.from(Object.values(elements)));
-                let randomArr = Array.from(Object.values(elements));
+                //let randomArr = shuffle(Array.from(elements));
+                let randomArr = Array.from(elements);
                 //console.log(`[WC] ${indent(level)} L${level} Starting cliky for ${randomArr.length} elements`);
                 //t randomArr = Array.from(Object.values(elements));
 
@@ -1372,7 +1452,8 @@ export class RequestExplorer {
                             ele.disabled = false;
                         } catch (ex){
                             //pass
-                            console.log("[WC] ERROR WITH THE ELEMENTS CLICKING : ", ex.stack);
+                            let safeErr = ex && typeof ex.message === 'string' ? ex.message : "Unknown Error";
+                            console.log("[WC] ERROR WITH THE ELEMENTS CLICKING : ", safeErr);
                         }
 
                         try {
@@ -1479,11 +1560,11 @@ export class RequestExplorer {
                                 }
                                 
                                 // have we added any clickable items that we need to now clicky?
-                                if (Object.keys(curDOM).length !== Object.keys(startingDOM).length && Object.keys(curDOM).length > 0){
+                                if (curDOM.length !== startingDOM.length && curDOM.length > 0){
                                     console.log(`[WC] maybe some difference here`)
                                     var changedDOM = getChangedDOM(startingDOM, curDOM);
-                                    console.log(`[WC] ${indent(level)} ${level} starting len = ${Object.keys(elements).length} cur len = ${Object.keys(curDOM).length} changed len=${Object.keys(changedDOM).length}`);
-                                    /*for (let cd of Object.keys(changedDOM)){
+                                    console.log(`[WC] ${indent(level)} ${level} starting len = ${elements.length} cur len = ${curDOM.length} changed len=${changedDOM.length}`);
+                                    /*for (let cd = 0; cd < changedDOM.length; cd++){
                                         console.log(`[WC] ${indent(level+1)} changedDOM #${cd} ${changedDOM[cd].textContent}`);
                                     }*/
                                     parentClicks.push(ele);
@@ -2056,6 +2137,14 @@ export class RequestExplorer {
         }
 
         let lastGT=0, lastGTCnt=0, gremCounterStr="";
+        let consecutiveLoopsWithoutNewKeys = 0;
+        let lastRequestsAddedCount = 0;
+        let totalRequestsAddedForThisURL = 0;
+        
+        // Track the set of all parameter keys seen during this page exploration
+        let seenKeysForThisPage = new Set();
+        let loopKeyStagnationCount = 0;
+
         try {
             //console.log("Performing timeout and element search");
             let errorLoopcnt = 0;
@@ -2080,7 +2169,49 @@ export class RequestExplorer {
                     this.requestsAdded = parseInt(this.requestsAdded);
                 }
                 let startingReqAdded = this.requestsAdded;
+                
+                // Track the current size of request collection to see which ones are added
+                let initialReqCount = Object.keys(this.appData.requestsFound).length;
+                
                 this.requestsAdded += await this.addDataFromBrowser(page, url);
+                
+                let newlyAddedInLoop = this.requestsAdded - startingReqAdded;
+                
+                // Smart Heuristic: Check if new requests actually introduced any new parameter keys
+                if (newlyAddedInLoop > 0) {
+                    let newKeysFoundInLoop = false;
+                    let allReqKeys = Object.keys(this.appData.requestsFound);
+                    // Check only the newly added requests at the end of the dictionary
+                    let newReqKeys = allReqKeys.slice(initialReqCount);
+                    
+                    for (let rk of newReqKeys) {
+                        let req = this.appData.requestsFound[rk];
+                        if (req) {
+                            let params = req.getAllParams();
+                            for (let pName in params) {
+                                if (!seenKeysForThisPage.has(pName)) {
+                                    seenKeysForThisPage.add(pName);
+                                    newKeysFoundInLoop = true;
+                                }
+                            }
+                        }
+                    }
+                    
+                    if (!newKeysFoundInLoop) {
+                        loopKeyStagnationCount++;
+                        console.log(`[WC] Loop generated ${newlyAddedInLoop} requests, but NO NEW PARAMETER KEYS were found (Stagnation count: ${loopKeyStagnationCount}).`);
+                    } else {
+                        loopKeyStagnationCount = 0; // Reset if we found new keys
+                    }
+                    
+                    // If we've had 3 consecutive loops that generated requests but NO new keys, 
+                    // it means Gremlins is just clicking the same forms with different values (e.g. date/time/random)
+                    if (loopKeyStagnationCount >= 3) {
+                        console.log(`[WC] CRITICAL: Page has generated requests with IDENTICAL KEYS but different values for 3 consecutive loops. Forcing exit to prevent infinite loop and value-explosion.`);
+                        break;
+                    }
+                }
+
                 if (cnt % 10 === 0){
                     console.log(`[WC] W#${this.workernum} ${shortname} Count ${cnt} Round ${this.appData.currentURLRound} loopcnt ${processedCnt}, added ${this.requestsAdded} reqs : Inputs: ${roundResults.totalInputs}, (${roundResults.equaltoRequests}/${roundResults.totalRequests}) reqs left to process ${gremCounterStr}`);
                 }
@@ -2126,11 +2257,12 @@ export class RequestExplorer {
                     gremlinsHaveFinished = await page.evaluate(()=>{return window.gremlinsHaveFinished;});
                     gremlinsHaveStarted = await page.evaluate(()=>{return window.gremlinsHaveStarted;});
                     console.log(`FIRST: gremlinsHaveStarted = ${gremlinsHaveStarted} gremlinsHaveFinished = ${gremlinsHaveFinished} browser_up=${this.browser_up} gremlinsTime=${gremlinsTime}`);
-                    // the idea, is that we will keep going as long as gremlinsTime gets reset before 30 seconds is up
-                    while (!gremlinsHaveFinished && this.browser_up && gremlinsTime < 30){
+                    // The idea is that we will keep going as long as gremlinsTime gets reset before max wait time is up.
+                    // Lowered the max time from 30 to 15, and check frequency from 3000ms to 1500ms to be more responsive.
+                    while (!gremlinsHaveFinished && this.browser_up && gremlinsTime < 15){
                         let currequestsAdded = this.requestsAdded;
-                        console.log(`LOOP: gremlinsHaveStarted = ${gremlinsHaveStarted} gremlinsHaveFinished = ${gremlinsHaveFinished} browser_up=${this.browser_up}  gremlinsTime=${gremlinsTime}`);
-                        await(sleepg(3000));
+                        // console.log(`LOOP: gremlinsHaveStarted = ${gremlinsHaveStarted} gremlinsHaveFinished = ${gremlinsHaveFinished} browser_up=${this.browser_up}  gremlinsTime=${gremlinsTime}`);
+                        await(sleepg(1500));
                         gremlinsHaveFinished = await page.evaluate(()=>{return window.gremlinsHaveFinished;});
                         gremlinsHaveStarted = await page.evaluate(()=>{return window.gremlinsHaveStarted;});
                         if (typeof(gremlinsHaveFinished) === "undefined" || gremlinsHaveFinished === null){
@@ -2138,16 +2270,17 @@ export class RequestExplorer {
                             await this.initpage(page, url, true);
                         }
                         if (gremlinsHaveStarted) {
-                            gremlinsTime += 3;
+                            gremlinsTime += 1.5;
                         }
                         if (currequestsAdded !== this.requestsAdded){
                             this.setPageTimer();
                             gremlinsTime = 0;
-                            console.log("[WC] resetting timers b/c new request found")
+                            // console.log("[WC] resetting timers b/c new request found")
                         }
                     }
                 } catch (ex){
-                    console.log("Error occurred while checking gremlins, restarting \nError Info: ", ex);
+                    let safeEx = ex && typeof ex.message === 'string' ? ex.message : "Unknown Error";
+                    console.log("Error occurred while checking gremlins, restarting \nError Info: ", safeEx);
                     errorLoopcnt ++;
                     if (errorLoopcnt < 10){
                         continue;
@@ -2180,7 +2313,7 @@ export class RequestExplorer {
             }
         } catch (e) {
             console.log(`Error: Browser cannot connect to ${url.href}`);
-            console.log(e.stack);
+            console.log(e.message);
             errorThrown = true;
 
         }
@@ -2211,8 +2344,14 @@ export class RequestExplorer {
         //     console.log(`loading gremscript from remote location ${this.gremlins_url}`);
         //     await page.addScriptTag({url: this.gremlins_url });
         // }
-        console.log(`loading gremscript from local `);
-        await page.addScriptTag({path: "gremlins.min.js"});
+        try{
+            await page.addScriptTag({path: GREMLINS_LOCAL_PATH});
+        } catch(ex){
+            try{
+                await page.addScriptTag({url: "https://unpkg.com/gremlins.js@2.2.0/dist/gremlins.min.js"});
+            } catch(ex2){
+            }
+        }
         
         this.isLoading = false;
 
@@ -2284,20 +2423,26 @@ export class RequestExplorer {
                     reqStore[this.currentRequestKey]["response_content-type"] = response.headers()["content-type"];
                 }
             }
-            if (response.status() >= 400) {
-                console.log(`[WC] Received response error (${response.status()}) for ${cururl} `);
-                return false;
-            }
-            //console.log(response);
 
-            //console.log("response Headers = ", await response.headers());
+            let responseText = await response.text();
+            let isInteractive = isInteractivePage(response, responseText);
+            
+            if (response.status() >= 400) {
+                // If it's an error status but the page has interactive/valuable content, we shouldn't discard it immediately
+                if (isInteractive) {
+                    console.log(`[WC] Received response error (${response.status()}) for ${cururl}, but page has interactive content. Keeping it and exploring.`);
+                } else {
+                    console.log(`[WC] Received response error (${response.status()}) for ${cururl}. Skipping exploration, but keeping in request_data for fuzzing.`);
+                    return false;
+                }
+            }
 
             if (response.status() !== 200) {
                 //console.log("[WC] ERROR status = ", response.status(), response.statusText(), response.url())
             }
-            let responseText = await response.text();
-            if (!isInteractivePage(response, responseText)) {
-                console.log(`[WC] ${cururl} is not an interactive page, skipping`);
+            
+            if (!isInteractive) {
+                console.log(`[WC] ${cururl} is not an interactive page. Skipping exploration, but keeping in request_data for fuzzing.`);
                 return false;
             }
             if (responseText.length < 20) {
@@ -2533,7 +2678,7 @@ export class RequestExplorer {
 
         const responseStatusCode = response.statusCode;
         if (responseStatusCode >= 400){
-            console.log(response);
+            console.log(`[WC] Response status ${responseStatusCode} during login for ${response.url()}`);
             console.log("\nERROR ERROR ERROR ERROR  LOGIN FAILED TO COMPLETE ERROR ERROR ERROR ");
             process.exit(39);
         }
@@ -2617,7 +2762,8 @@ export class RequestExplorer {
     }
     getRoundResults(){
         let total = 0, above = 0, below = 0, equalto = 0;
-        for (const [key, val] of Object.entries(this.appData.requestsFound)) {
+        for (let key in this.appData.requestsFound) {
+            let val = this.appData.requestsFound[key];
             total++;
             equalto += val["attempts"] === this.appData.currentURLRound ? 1 : 0;
             above += val["attempts"] === this.appData.currentURLRound ? 0 : 1;
@@ -2625,9 +2771,12 @@ export class RequestExplorer {
         return {totalInputs:this.appData.numInputsFound(), totalRequests: total, equaltoRequests: equalto, aboveRequests:above}
     }
     reportResults(){
-        if (Object.entries(this.shownMessages).length > 0) {
+        let hasShownMessages = false;
+        for (let k in this.shownMessages) { hasShownMessages = true; break; }
+        if (hasShownMessages) {
             console.log("ERRORS:");
-            for (const [key, val] of Object.entries(this.shownMessages)) {
+            for (let key in this.shownMessages) {
+                let val = this.shownMessages[key];
                 let strindex = key.indexOf("\n");
                 strindex = strindex === -1 ? key.length : strindex;
                 console.log(`\tERROR msg '${key.substring(0, strindex)}' seen ${val} times`);
@@ -2667,18 +2816,43 @@ export class RequestExplorer {
                 console.log("[WC] Caught interrupt signal, attempting to exit");
                 process.exit(99);
             });
+            process.once('SIGTERM', function() {
+                console.log("[WC] Caught SIGTERM, attempting to exit");
+                process.exit(98);
+            });
         }
         async function targetChanged(target){
 
             try {
+                if (!target || typeof target.page !== "function"){
+                    return;
+                }
                 const newPage = await target.page();
-                var newurl = newPage.target().url();
+                if (!newPage){
+                    return;
+                }
+                if (typeof newPage.target !== "function"){
+                    return;
+                }
+                let newTarget = newPage.target();
+                if (!newTarget || typeof newTarget.url !== "function"){
+                    return;
+                }
+                var newurl = newTarget.url();
 
-                if (target.url() !== self.url.href && target.url().startsWith(`${self.appData.site_url.origin}`)) {
+                let turl = "";
+                try{
+                    if (typeof target.url === "function"){
+                        turl = target.url();
+                    }
+                } catch(ex){
+                    turl = "";
+                }
+                if (turl !== "" && turl !== self.url.href && turl.startsWith(`${self.appData.site_url.origin}`)) {
 
                     //console.log(`TARGETED CHANGED from ${self.url.href} to ${target.url()} `);
                     //console.log(target);
-                    let foundRequest = FoundRequest.requestParamFactory(target.url(),"GET", "",{},"targetChanged", self.appData.site_url.href);
+                    let foundRequest = FoundRequest.requestParamFactory(turl,"GET", "",{},"targetChanged", self.appData.site_url.href);
                     foundRequest.from = "targetChanged";
                     self.requestsAdded += self.appData.addInterestingRequest(foundRequest);
 
@@ -2704,7 +2878,7 @@ export class RequestExplorer {
                 //self.page = newPage;
             } catch (e) {
                 console.log(`TARGET CHANGED Error: target changed encountered an error`);
-                console.log(e.stack);
+                console.log(e.message);
                 //await browser.close();
             }
 
@@ -2725,24 +2899,50 @@ export class RequestExplorer {
                 self.gremlins_error = true;
             } else {
                 self.shownMessages[msg] = 1;
-                console.log("\x1b[38;5;136mBrowser JS Error:\n\t", error.message, "\x1b[0m");
+                // Avoid printing error.message which might trigger a full object serialization in V8
+                // when it is a deeply nested or circular Puppeteer/V8 Error object.
+                let safeMessage = error && typeof error.message === 'string' ? error.message : "Unknown Error";
+                console.log("\x1b[38;5;136mBrowser JS Error:\n\t", safeMessage, "\x1b[0m");
             }
 
         }
 
         function consoleLog (message) {
+            if (typeof self._consoleLogWindowStart !== "number"){
+                self._consoleLogWindowStart = Date.now();
+                self._consoleLogWindowCount = 0;
+            }
+            let now = Date.now();
+            if (now - self._consoleLogWindowStart > 1000){
+                self._consoleLogWindowStart = now;
+                self._consoleLogWindowCount = 0;
+            }
+            self._consoleLogWindowCount += 1;
+            if (self._consoleLogWindowCount > 50){
+                return;
+            }
 
             if (message.text().indexOf("[WC]") > -1) {
                 if (message.text().indexOf("lamehorde is done") > -1){
                     console.log(`[\x1b[38;5;136mWC${ENDCOLOR}] Lamehorde completion detected`);
                     self.lamehord_done = true;
                 } else {
-                    console.log(message.text());
+                    let t = message.text();
+                    if (t.length > 500){
+                        t = t.slice(0,500);
+                    }
+                    console.log(t);
                 }
-            } else if (message.text().search("[WC-URL]") > - 1){
-                let urlstr = message.text().slice("[WC-URL]".length);
+            } else if (message.text().startsWith("[WC-URL]")){
+                let urlstr = message.text().slice("[WC-URL]".length).trim();
+                if (!(urlstr.startsWith("http") || urlstr.startsWith("/") || urlstr.startsWith("./") || urlstr.startsWith("../"))){
+                    return;
+                }
                 console.log(`[WC] puppeteer layer recieved url from browser with urlstr='${urlstr}'`);
-                self.appData.addValidURLS([urlstr], `${self.appData.site_url.href}`,"ConsleRecvd");
+                try{
+                    self.appData.addValidURLS([urlstr], new URL(self.appData.site_url.href), "ConsleRecvd");
+                } catch(ex){
+                }
                 
             } else if (message.text().search("CW DOCUMENT") === -1 && message.text() !== "JSHandle@node") {
                 if (message.text().indexOf("gremlin") > -1){
@@ -2753,11 +2953,16 @@ export class RequestExplorer {
                     if (message.text().startsWith("jQuery") || message.text().startsWith("disabled") || message.text().startsWith("__ko__")) {
                         // do nothing
                     } else {
-                        console.log(message.text())
+                        let t = message.text();
+                        if (t.length > 200){
+                            t = t.slice(0,200);
+                        }
+                        console.log(t)
                     }
                 }
             }
         }
+
 
         /**
          * Two phases, in the first, we record and save any relevant request information on local requests.
@@ -2771,7 +2976,19 @@ export class RequestExplorer {
             if (req.method() !== "GET" || req.postData() || req.resourceType() === "xhr"){
                 //console.log("NONGET: ", req.url(), "method=",req.method(), "restype=", req.resourceType(), "data=", req.postData());
             }
+            
             let tempurl = new URL(req.url());
+            
+            // Joomla com_config protection: drop large config.store POST requests
+            // These requests modify the global site config and can take the site offline.
+            if (req.method() === 'POST' && tempurl.pathname.includes('index.php') && tempurl.search.includes('option=com_config')) {
+                if (tempurl.search.includes('task=config.store') || (req.postData() && req.postData().length > 2000)) {
+                    console.log(`\x1b[38;5;1mINTERCEPTED and ABORTED Joomla config modification URL ${req.url()}\x1b[0m`);
+                    req.abort();
+                    return;
+                }
+            }
+
             if (tempurl.pathname.search(/\.css$/) > -1 || tempurl.pathname.search(/\.js$/) > -1) {
                 console.log("CSS/JS Request Coming THROUGH!!!!! ", req.url(), "method=",req.method(), "restype=", req.resourceType(), "data=", req.postData());
                 req.continue()
@@ -2802,7 +3019,9 @@ export class RequestExplorer {
                 let foundRequest = FoundRequest.requestObjectFactory(req, self.appData.site_url.href);
                 foundRequest.from="InterceptedRequestSelf";
 
-                for (let [pkey, pvalue] of Object.entries(foundRequest.getAllParams())){
+                let allParams = foundRequest.getAllParams();
+                for (let pkey in allParams){
+                    let pvalue = allParams[pkey];
                     if (typeof pvalue === "object"){
                         pvalue = pvalue.values().next().value;
                     }
@@ -2838,7 +3057,9 @@ export class RequestExplorer {
                     let foundRequest = FoundRequest.requestObjectFactory(req, self.appData.site_url.href);
                     foundRequest.from="InterceptedRequest";
 
-                    for (let [pkey, pvalue] of Object.entries(foundRequest.getAllParams())){
+                    let allParams2 = foundRequest.getAllParams();
+                    for (let pkey in allParams2){
+                        let pvalue = allParams2[pkey];
                         if (typeof pvalue === "object"){
                             pvalue = pvalue.values().next().value;
                         }

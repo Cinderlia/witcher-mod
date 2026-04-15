@@ -95,29 +95,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     write_lines(base_appdir / php_list_fn, sorted(dedupe_list(leaf_relpaths(tree))))
 
     urls = []
-
-    if run_code_scan:
-        cs_out_fn = cfg.get("code_scan", {}).get("output_filename", args.output)
-        code_urls = collect_code_scan_urls(
-            base_url=base_url,
-            source_dir=source_dir,
-            max_file_bytes=args.max_file_bytes,
-            tree=tree,
-        )
-        write_lines(base_appdir / cs_out_fn, code_urls)
-        urls.extend(code_urls)
-        seed_afl_request_data_json(str(base_appdir), code_urls)
-        update_request_data_meta(str(base_appdir), {"code_scan": True})
-        selected_relpaths = get_selected_relpaths(tree)
-        write_lines(base_appdir / "selected_php_files.txt", selected_relpaths)
+    valid_entry_files = None
 
     if run_param_pipeline:
-        if not run_code_scan:
-            apply_selected_from_file(tree, base_appdir / "selected_php_files.txt")
-        unselected_urls = build_unselected_urls(tree, base_url)
-        unselected_out = cfg.get("code_scan", {}).get("unselected_output_filename", "initial_urls_unselected.txt")
-        write_lines(base_appdir / unselected_out, unselected_urls)
-
         ps_cfg = cfg.get("param_scan", {})
         run_param_scan(
             tree=tree,
@@ -131,11 +111,75 @@ def main(argv: Optional[List[str]] = None) -> int:
             },
         )
 
-        integrated_out_fn = cfg.get("integrated_urls_filename", args.output)
-        integrated_path = output_path if integrated_out_fn == args.output else (base_appdir / integrated_out_fn)
-        write_lines(integrated_path, urls)
-        print("urls_written={}".format(len(urls)))
-        print("output={}".format(str(integrated_path)))
+        unselected_urls = build_unselected_urls(tree, base_url)
+        unselected_out = cfg.get("code_scan", {}).get("unselected_output_filename", "initial_urls_unselected.txt")
+        write_lines(base_appdir / unselected_out, unselected_urls)
+
+        crawler_cfg = cfg.get("crawler", {})
+        start_crawler = args.start_crawler or (isinstance(crawler_cfg, dict) and crawler_cfg.get("start", False))
+        
+        if start_crawler:
+            if args.xvfb:
+                if not isinstance(crawler_cfg, dict):
+                    crawler_cfg = {}
+                crawler_cfg["xvfb"] = True
+            if args.no_headless:
+                if not isinstance(crawler_cfg, dict):
+                    crawler_cfg = {}
+                crawler_cfg["no_headless"] = True
+            if args.timeout:
+                if not isinstance(crawler_cfg, dict):
+                    crawler_cfg = {}
+                crawler_cfg["timeout"] = args.timeout
+    
+            rc = _run_param_minimizer(base_url, str(base_appdir), cfg, crawler_cfg)
+            if rc == 0:
+                update_request_data_meta(str(base_appdir), {"param_scan": True})
+                
+                valid_entry_files = set()
+                try:
+                    with open(base_appdir / "afl_request_data.json", "r", encoding="utf-8") as rf:
+                        data = json.load(rf)
+                        reqs = data.get("requestsFound", {})
+                        for req in reqs.values():
+                            if req.get("from") == "initialParamMin":
+                                u = req.get("_urlstr", "")
+                                if u:
+                                    base_u = u.split("?")[0].split("#")[0]
+                                    valid_entry_files.add(base_u)
+                except Exception as ex:
+                    print("Failed to read valid entry files: {}".format(ex))
+
+    if run_code_scan:
+        cs_out_fn = cfg.get("code_scan", {}).get("output_filename", args.output)
+        code_urls = collect_code_scan_urls(
+            base_url=base_url,
+            source_dir=source_dir,
+            max_file_bytes=args.max_file_bytes,
+            tree=tree,
+        )
+        
+        if valid_entry_files is not None:
+            filtered_code_urls = []
+            for cu in code_urls:
+                cu_base = cu.split("?")[0].split("#")[0]
+                if cu_base in valid_entry_files:
+                    filtered_code_urls.append(cu)
+            print(f"Filtered code_urls from {len(code_urls)} to {len(filtered_code_urls)} using valid_entry_files")
+            code_urls = filtered_code_urls
+
+        write_lines(base_appdir / cs_out_fn, code_urls)
+        urls.extend(code_urls)
+        seed_afl_request_data_json(str(base_appdir), code_urls)
+        update_request_data_meta(str(base_appdir), {"code_scan": True})
+        selected_relpaths = get_selected_relpaths(tree)
+        write_lines(base_appdir / "selected_php_files.txt", selected_relpaths)
+
+    integrated_out_fn = cfg.get("integrated_urls_filename", args.output)
+    integrated_path = output_path if integrated_out_fn == args.output else (base_appdir / integrated_out_fn)
+    write_lines(integrated_path, urls)
+    print("urls_written={}".format(len(urls)))
+    print("output={}".format(str(integrated_path)))
 
     crawler_cfg = cfg.get("crawler", {})
     start_crawler = args.start_crawler or (isinstance(crawler_cfg, dict) and crawler_cfg.get("start", False))
@@ -152,11 +196,6 @@ def main(argv: Optional[List[str]] = None) -> int:
             if not isinstance(crawler_cfg, dict):
                 crawler_cfg = {}
             crawler_cfg["timeout"] = args.timeout
-
-        if run_param_pipeline:
-            rc = _run_param_minimizer(base_url, str(base_appdir), cfg, crawler_cfg)
-            if rc == 0:
-                update_request_data_meta(str(base_appdir), {"param_scan": True})
 
         _start_request_crawler(base_url, str(base_appdir), crawler_cfg)
 
@@ -260,7 +299,10 @@ def _start_request_crawler(base_url: str, base_appdir: str, crawler_cfg: dict) -
         crawler_js = (Path(__file__).resolve().parent.parent / "request_crawler" / "main.js").resolve()
         cmd = []
         if timeout_value:
-            cmd.extend(["timeout", timeout_value])
+            kill_after = "30s"
+            if isinstance(crawler_cfg, dict) and crawler_cfg.get("timeout_kill_after"):
+                kill_after = str(crawler_cfg.get("timeout_kill_after") or "").strip() or "30s"
+            cmd.extend(["timeout", "-k", kill_after, timeout_value])
         if use_xvfb:
             cmd.extend(["xvfb-run", "-a"])
 
@@ -477,7 +519,10 @@ def _run_param_minimizer(base_url: str, base_appdir: str, cfg: dict, crawler_cfg
     script_js = (Path(__file__).resolve().parent.parent / "request_crawler" / "param_minimizer.js").resolve()
     cmd = []
     if timeout_value:
-        cmd.extend(["timeout", timeout_value])
+        kill_after = "30s"
+        if isinstance(crawler_cfg, dict) and crawler_cfg.get("timeout_kill_after"):
+            kill_after = str(crawler_cfg.get("timeout_kill_after") or "").strip() or "30s"
+        cmd.extend(["timeout", "-k", kill_after, timeout_value])
     if use_xvfb:
         cmd.extend(["xvfb-run", "-a"])
     cmd.extend([node_bin, str(script_js)])

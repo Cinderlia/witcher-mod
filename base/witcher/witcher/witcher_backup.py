@@ -293,32 +293,111 @@ class Witcher():
     def create_seeds(self, requests):
         seed_name_stub = os.path.join(self.seed_path,"seed-")
         seeds = []
-        if len(requests) > 50:
-            requests = requests[:10]
+        
+        # Parse all requests to filter out >10KB and compute parameter diversity
+        parsed_reqs = []
         for reqkey in requests:
-
             req = self.request_data["requestsFound"].get(reqkey,None)
             if req is None:
                 print(f"[Witcher]\033[32m Did not find {reqkey} in request data. \033[0m")
                 continue
-                #req = self.request_data["requestsFound"].get(reqkey, None)
 
-            strid = req["_id"]
             url = urlparse(req["_url"])
-
             cookie_data = req.get('_cookieData','').encode("utf-8")
             urlquery = url.query.encode("utf-8")
             post_data = req.get('_postData','').encode("utf-8")
+            
+            # Trim long values from URL-encoded data to prevent initial seeds from containing 
+            # huge blocks of useless text (like full articles or huge JSON payloads)
+            from urllib.parse import parse_qsl, urlencode
+            
+            def trim_long_values(encoded_data):
+                if not encoded_data:
+                    return b""
+                try:
+                    # decode -> parse -> trim values -> re-encode
+                    decoded = encoded_data.decode("utf-8")
+                    params = parse_qsl(decoded, keep_blank_values=True)
+                    trimmed_params = []
+                    for k, v in params:
+                        # If a parameter value is longer than 64 chars, truncate it.
+                        # It keeps the structure intact but removes the bulk payload.
+                        if len(v) > 64:
+                            v = v[:64]
+                        trimmed_params.append((k, v))
+                    return urlencode(trimmed_params).encode("utf-8")
+                except Exception:
+                    # Fallback if parsing fails
+                    return encoded_data
 
-            headers = req.get('_headers','')
+            urlquery = trim_long_values(urlquery)
+            post_data = trim_long_values(post_data)
+
+            headers = req.get('_headers', {})
             headers_out = ""
+            ignore_headers = {"HOST", "CONTENT-LENGTH", "CONNECTION", "COOKIE", "ACCEPT-ENCODING"}
             for k,v in headers.items():
-                if k.upper() == "SOAPACTION" or k.upper() == "HNAP_AUTH":
-                    headers_out += f"{k}:{v}\n"
+                if k.upper() not in ignore_headers:
+                    headers_out += f"{k}: {v}\n"
 
             strout = b"%s\x00%s\x00%s\x00%s" % (cookie_data, urlquery, post_data, headers_out.encode('utf-8'))
-            if len(strout) > 3:
-                seeds.append(strout)
+            
+            # Filter out seeds that are > 10KB or empty
+            if len(strout) <= 3 or len(strout) > 10240:
+                continue
+                
+            # Extract keys for diversity scoring
+            from urllib.parse import parse_qsl
+            keys = set()
+            keys.update([k for k, v in parse_qsl(url.query)])
+            keys.update([k for k, v in parse_qsl(req.get('_postData', ''))])
+            keys.update([k for k, v in parse_qsl(req.get('_cookieData', ''))])
+            
+            # Skip requests with absolutely no parameters
+            if len(keys) == 0:
+                continue
+                
+            parsed_reqs.append({
+                'strout': strout,
+                'keys': keys,
+                'key_count': len(keys)
+            })
+
+        # If we have more than 50 seeds, select the 50 most diverse ones
+        if len(parsed_reqs) > 50:
+            # Sort by number of keys descending as a base heuristic
+            parsed_reqs.sort(key=lambda x: x['key_count'], reverse=True)
+            
+            selected_reqs = [parsed_reqs[0]] # Always take the one with the most keys
+            seen_keys = set(parsed_reqs[0]['keys'])
+            
+            # Greedily select seeds that add the most NEW keys
+            while len(selected_reqs) < 50:
+                best_req = None
+                best_new_keys_count = -1
+                
+                for req in parsed_reqs:
+                    if req in selected_reqs:
+                        continue
+                    new_keys = req['keys'] - seen_keys
+                    if len(new_keys) > best_new_keys_count:
+                        best_new_keys_count = len(new_keys)
+                        best_req = req
+                        
+                # If no new keys can be found, just take the next largest one
+                if best_req is None or best_new_keys_count == 0:
+                    for req in parsed_reqs:
+                        if req not in selected_reqs:
+                            best_req = req
+                            break
+                            
+                selected_reqs.append(best_req)
+                seen_keys.update(best_req['keys'])
+                
+            parsed_reqs = selected_reqs
+
+        seeds = [req['strout'] for req in parsed_reqs]
+        
         if len(seeds) == 0:
             seeds.append(b"cookie=flour\x00query=search\x00post=hole")
         return seeds
@@ -461,9 +540,37 @@ class Witcher():
         else:
             binary_options = self.binary_options
 
+        base_time = self.timeout
+        num_seeds = len(seeds) if seeds else 0
+
+        if hasattr(self, 'global_timeout') and self.global_timeout > 0 and getattr(self, 'current_allocated_time', None) is not None:
+            dynamic_timeout = self.current_allocated_time
+            if getattr(self, 'is_last_target', False):
+                print(f"[*] Last target, adding all remaining extra fuzz time: {self.extra_fuzz_time:.0f}s")
+                dynamic_timeout += self.extra_fuzz_time
+                self.extra_fuzz_time = 0
+            
+            check_interval = dynamic_timeout * 0.1
+            half_check_interval = dynamic_timeout * 0.05
+            time_adjustment = dynamic_timeout * 0.05
+            max_allowed_time = dynamic_timeout * 2.5
+        else:
+            # 初始分配：1个seed给10%，但保底20%（防止AFL还没校准完就被杀），上限150%
+            initial_ratio = min(max(0.1 * num_seeds, 0.2), 1.5)
+            dynamic_timeout = base_time * initial_ratio
+            check_interval = base_time * 0.1
+            half_check_interval = base_time * 0.05
+            time_adjustment = base_time * 0.05
+            max_allowed_time = base_time * 2.5
+
+        last_check_time = 0
+        last_paths_total = 0
+        half_check_done = False
+        # ----------------------------------------
+
         fuzzer = Phuzzer.phactory(phuzzer_type=Phuzzer.WITCHER_AFL, target=self.fuzzer_target_binary, target_opts=binary_options,
                                   work_dir=self.work_dir, seeds=seeds, afl_count=self.cores,
-                                  create_dictionary=False, timeout=self.timeout, memory=self.memory,
+                                  create_dictionary=False, timeout=dynamic_timeout, memory=self.memory,
                                   run_timeout=self.run_timeout, dictionary=dictionary_str,
                                   use_qemu=self.use_qemu, resume=do_resume, login_json_fn=self.config_loc,
                                   base_port=self.server_base_port, container_info=self.container_info, fault_escalation=not self.no_fault_escalation)
@@ -477,7 +584,7 @@ class Witcher():
                 fuzzer.chown_container_files(pwd.getpwuid( os.getuid() ).pw_uid)
 
         start_results = {"totalfail": False, "timeout": False }
-        reporter = Reporter(self.fuzzer_target_binary, self.report_dir, self.cores, self.first_crash, self.timeout,
+        reporter = Reporter(self.fuzzer_target_binary, self.report_dir, self.cores, self.first_crash, dynamic_timeout,
                             fuzzer.work_dir, chown_files=chown_files)
 
         reporter.set_script_filename(target_path)
@@ -535,6 +642,48 @@ class Witcher():
                     start_results["timeout"] = True
                     print("\n[*] Timeout reached.")
                     break
+
+                if not half_check_done and run_time >= half_check_interval:
+                    half_check_done = True
+                    try:
+                        stats = fuzzer.stats
+                        last_paths_total = sum(int(f.get('paths_total', 0)) for f in stats.values())
+                        print(f"\n[*] Dynamic Fuzz: 5% checkpoint. Initial paths = {last_paths_total}")
+                    except Exception:
+                        pass
+
+                if run_time - last_check_time >= check_interval:
+                    last_check_time = run_time
+                    try:
+                        stats = fuzzer.stats
+                        current_paths_total = sum(int(f.get('paths_total', 0)) for f in stats.values())
+
+                        if current_paths_total > last_paths_total:
+                            if hasattr(self, 'global_timeout') and self.global_timeout > 0:
+                                if self.extra_fuzz_time > 0:
+                                    actual_adjustment = min(time_adjustment, self.extra_fuzz_time)
+                                    fuzzer.timeout = min(fuzzer.timeout + actual_adjustment, max_allowed_time)
+                                    self.extra_fuzz_time -= actual_adjustment
+                                    print(f"\n[*] Dynamic Fuzz: Paths grew ({last_paths_total} -> {current_paths_total}). Timeout increased by {actual_adjustment:.0f}s to {fuzzer.timeout:.0f}s (Remaining extra: {self.extra_fuzz_time:.0f}s)")
+                                else:
+                                    print(f"\n[*] Dynamic Fuzz: Paths grew ({last_paths_total} -> {current_paths_total}). No extra time available, timeout unchanged.")
+                            else:
+                                fuzzer.timeout = min(fuzzer.timeout + time_adjustment, max_allowed_time)
+                                print(f"\n[*] Dynamic Fuzz: Paths grew ({last_paths_total} -> {current_paths_total}). Timeout increased to {fuzzer.timeout:.0f}s (Max {max_allowed_time:.0f}s)")
+                        elif current_paths_total > 0:
+                            old_timeout = fuzzer.timeout
+                            fuzzer.timeout = fuzzer.timeout - time_adjustment
+                            if hasattr(self, 'global_timeout') and self.global_timeout > 0:
+                                self.extra_fuzz_time += (old_timeout - fuzzer.timeout)
+                                print(f"\n[*] Dynamic Fuzz: Paths stalled at {current_paths_total}. Timeout decreased to {fuzzer.timeout:.0f}s. Added to extra time (Total extra: {self.extra_fuzz_time:.0f}s)")
+                            else:
+                                print(f"\n[*] Dynamic Fuzz: Paths stalled at {current_paths_total}. Timeout decreased to {fuzzer.timeout:.0f}s")
+
+                        last_paths_total = current_paths_total
+                    except Exception:
+                        pass
+                # ------------------------------------
+
                 run_time += 1
                 time.sleep(1)
 
@@ -552,10 +701,14 @@ class Witcher():
             raise
         finally:
             print("[*] Terminating fuzzer.")
+            if hasattr(self, 'global_timeout') and self.global_timeout > 0:
+                unused_time = max(0, fuzzer.timeout - run_time)
+                if unused_time > 0:
+                    self.extra_fuzz_time += unused_time
+                    print(f"[*] Fuzzer finished early. Added {unused_time:.0f}s to extra time (Total extra: {self.extra_fuzz_time:.0f}s)")
             chown_files()
             reporter.stop()
             fuzzer.stop()
-            os.system("rm -f /tmp/start_test.dat")
             if self.kill:
                 exit(199)
         return start_results
@@ -782,7 +935,42 @@ class Witcher():
                 targets = trial["targets"].copy()
                 print(f"Trial start = {trial['trial_start']}")
 
-                if self.jconfig["script_random_order"] == 1:
+                self.global_timeout = int(self.jconfig.get("global_timeout", 0))
+                if self.global_timeout > 0:
+                    self.extra_fuzz_time = 0.0
+                    valid_targets = []
+                    t_start = self.jconfig.get("script_start_index", 0)
+                    t_end = self.jconfig.get("script_end_index", len(targets))
+                    for t in targets[t_start:t_end]:
+                        if self.single_target and t['target_path'].find(self.single_target) == -1:
+                            continue
+                        if self.target_contains_skiplist_value(t['target_path']):
+                            continue
+                        valid_targets.append(t)
+                    
+                    for t in valid_targets:
+                        t['_seed_count'] = len(self.create_seeds(t.get("requests", [])))
+                    
+                    valid_targets.sort(key=lambda x: x['_seed_count'])
+                    
+                    total_seeds = sum(t['_seed_count'] for t in valid_targets)
+                    effective_global_timeout = self.global_timeout / max(1, nbr_refuzzes)
+                    if total_seeds == 0:
+                        total_seeds = max(1, len(valid_targets))
+                        for t in valid_targets:
+                            t['_allocated_time'] = effective_global_timeout / total_seeds
+                    else:
+                        for t in valid_targets:
+                            t['_allocated_time'] = (t['_seed_count'] / total_seeds) * effective_global_timeout
+                    
+                    targets = valid_targets
+                    self.jconfig["script_start_index"] = 0
+                    self.jconfig["script_end_index"] = len(targets)
+                    if self.jconfig.get("script_random_order"):
+                        print("[*] global_timeout is set, disabling script_random_order to prioritize fewer seeds first.")
+                        self.jconfig["script_random_order"] = 0
+
+                if self.jconfig.get("script_random_order") == 1:
                     random.shuffle(targets)
 
                 self.start_external_servers()
@@ -793,7 +981,10 @@ class Witcher():
                     target_start = self.jconfig.get("script_start_index", 0)
                     target_end = self.jconfig.get("script_end_index", len(targets))
 
-                    for target in targets[target_start: target_end]:
+                    sliced_targets = targets[target_start: target_end]
+                    for i, target in enumerate(sliced_targets):
+                        self.is_last_target = (i == len(sliced_targets) - 1)
+                        self.current_allocated_time = target.get('_allocated_time')
 
                         if self.single_target and target['target_path'].find(self.single_target) == -1: # if using single target and not in target name then skip
                             continue

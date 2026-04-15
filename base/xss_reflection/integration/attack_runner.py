@@ -2,6 +2,8 @@ import json
 import os
 import shutil
 from typing import Dict, List, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 from ..analysis.context_locator import ContextLocator
 from ..attack.dispatcher import get_handler
@@ -21,6 +23,8 @@ class TargetedAttackRunner:
         self.mutator = SeedMutator()
         self.runner = CGIRunner(work_dir)
         self._confirm_index = 0
+        self._confirm_lock = threading.Lock()
+        self._log_lock = threading.Lock()
 
     def run(self) -> Dict[str, int]:
         script_path = self.runner.find_script()
@@ -35,10 +39,16 @@ class TargetedAttackRunner:
         confirmed = 0
         total_contexts: Dict[str, int] = {}
         total_confirmed: Dict[str, int] = {}
-        for fuzzer_dir in self._fuzzer_dirs():
+        fuzzer_dirs = self._fuzzer_dirs()
+
+        def one(fuzzer_dir: str):
+            executed = 0
+            confirmed = 0
+            total_contexts: Dict[str, int] = {}
+            total_confirmed: Dict[str, int] = {}
             queue_root = os.path.join(fuzzer_dir, self.output_dir_name)
             if not os.path.isdir(queue_root):
-                continue
+                return 0, 0, total_contexts, total_confirmed
             for seed_dir in self._seed_dirs(queue_root):
                 hits_dir = os.path.join(seed_dir, "hits")
                 if not os.path.isdir(hits_dir):
@@ -111,12 +121,30 @@ class TargetedAttackRunner:
                     f"Witcher-XSS attack validated {seed_dir} executed={executed} confirmed={confirmed} "
                     f"contexts={seed_contexts} confirmed_types={seed_confirmed}"
                 )
+            return executed, confirmed, total_contexts, total_confirmed
+
+        max_workers = max(1, min(len(fuzzer_dirs), os.cpu_count() or 4))
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futs = [ex.submit(one, fd) for fd in (fuzzer_dirs or [])]
+            for fu in as_completed(futs):
+                try:
+                    exed, conf, ctx_map, conf_map = fu.result()
+                except Exception:
+                    continue
+                executed += int(exed)
+                confirmed += int(conf)
+                for k, v in (ctx_map or {}).items():
+                    total_contexts[k] = total_contexts.get(k, 0) + int(v)
+                for k, v in (conf_map or {}).items():
+                    total_confirmed[k] = total_confirmed.get(k, 0) + int(v)
         self._log(f"Witcher-XSS attack summary contexts={total_contexts} confirmed_types={total_confirmed}")
         return {"attack_executed": executed, "attack_confirmed": confirmed}
 
     def _save_confirmed(self, confirmed_dir: str, seed_bytes: bytes, context_type: str, payload: str, body: str) -> None:
-        self._confirm_index += 1
-        name = f"{context_type}-attack-{self._confirm_index}"
+        with self._confirm_lock:
+            self._confirm_index += 1
+            idx = int(self._confirm_index)
+        name = f"{context_type}-attack-{idx}"
         out_seed = os.path.join(confirmed_dir, name)
         with open(out_seed, "wb") as wf:
             wf.write(seed_bytes)
@@ -168,7 +196,7 @@ class TargetedAttackRunner:
     def _fuzzer_dirs(self) -> List[str]:
         items = []
         for name in sorted(os.listdir(self.work_dir)):
-            if name == "fuzzer-master" or name.startswith("fuzzer-"):
+            if name == "fuzzer-master" or (name.startswith("fuzzer-") and name != "extsync"):
                 path = os.path.join(self.work_dir, name)
                 if os.path.isdir(path):
                     items.append(path)
@@ -176,8 +204,9 @@ class TargetedAttackRunner:
 
     def _log(self, message: str) -> None:
         print(f"[Witcher-XSS] {message}")
-        with open(self.log_path, "a", encoding="utf-8") as wf:
-            wf.write(message + "\n")
+        with self._log_lock:
+            with open(self.log_path, "a", encoding="utf-8") as wf:
+                wf.write(message + "\n")
 
 
 def run_targeted_attacks(work_dir: str, output_dir_name: str = "xss_queue") -> Dict[str, int]:

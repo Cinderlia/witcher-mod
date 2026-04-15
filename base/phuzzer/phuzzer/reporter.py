@@ -9,9 +9,9 @@ from collections import defaultdict
 
 
 class Reporter(Thread):
-    DETAIL_FREQ = 1
+    DETAIL_FREQ = 10
 
-    def __init__(self, binary, reportdir, afl_cores, first_crash, timeout,  work_dir, testversion="", chown_files=None):
+    def __init__(self, binary, reportdir, afl_cores, first_crash, timeout,  work_dir, testversion="", chown_files=None, fuzzer=None):
         Thread.__init__(self)
         self.binary = binary
         self.reportdir = reportdir
@@ -20,6 +20,7 @@ class Reporter(Thread):
         self.timeout = timeout
         self.timeout_seen = False
         self.work_dir = work_dir
+        self.fuzzer = fuzzer
 
         self.details_fn = f"{reportdir}/run_details.txt"
         self.summary_fn = f"{reportdir}/run_summary.txt"
@@ -54,10 +55,9 @@ class Reporter(Thread):
         self.script_filename = script_fn
 
     def run(self):
-        time.sleep(10)
         while self.keepgoing:
-            self.generate_report_line()
             time.sleep(1)
+            self.generate_report_line(fuzzer=self.fuzzer)
             
     def enable_printing(self):
         self.do_printing = True
@@ -114,20 +114,15 @@ class Reporter(Thread):
                                     print(ke)
                                     traceback.format_exc()
                                     print(self.stats.keys())
+                    if not self.stats[fuzzer_dir]:
+                        del self.stats[fuzzer_dir]
+                        continue
 
-                    try:
-                        fuzz_q_mask = os.path.join(self.work_dir, fuzzer_dir, "crashes", "id*")
-                        self.stats[fuzzer_dir]["unique_crashes"] = len(glob.glob(fuzz_q_mask))
-                        fuzz_q_mask = os.path.join(self.work_dir, fuzzer_dir, "queue", "id*")
-                        self.stats[fuzzer_dir]["paths_total"] = len(glob.glob(fuzz_q_mask))
-                    except KeyError as ke:
-                        print(ke)
-                        traceback.format_exc()
-                        print(self.stats.keys())
-
-    def print_details(self, mandatory_print=False):
+    def print_details(self, mandatory_print=False, fuzzer=None):
         timeout_str = ""
         run_until_str = ""
+        if fuzzer and hasattr(fuzzer, "timeout"):
+            self.timeout = fuzzer.timeout
         self.elapsed_time = time.time() - self.start_time
         if self.timeout:
             if self.first_crash:
@@ -159,7 +154,7 @@ class Reporter(Thread):
         self.last_printed_crashes = self.summary_stats["unique_crashes"]
         self.last_printed_paths_total = self.summary_stats["paths_total"]
 
-    def generate_report_line(self, mandatory_record=False):
+    def generate_report_line(self, mandatory_record=False, fuzzer=None):
         if not os.access(os.path.join(self.work_dir,"fuzzer-master","fuzzer_stats"), os.R_OK):
             if self.chown_files is None:
                 pass
@@ -177,8 +172,8 @@ class Reporter(Thread):
             with open(self.details_fn, "a+") as fp :
                 fp.write(self.build_report_stats() + "\n")
 
-        if self.do_printing:
-            self.print_details(mandatory_record)
+        if self.do_printing and (self.statement_cnt % Reporter.DETAIL_FREQ == 0 or mandatory_record):
+            self.print_details(mandatory_record, fuzzer)
 
     def build_report_stats(self, end_reason=""):
 

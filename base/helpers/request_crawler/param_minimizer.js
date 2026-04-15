@@ -249,10 +249,21 @@ async function visit(page, targetUrl, method, postData, cookieHeader){
         if (redirected){
             return {ok:false, valuable:false, status, redirected:true};
         }
-        if (status >= 400){
-            return {ok:false, valuable:false, status, redirected:false};
-        }
+        
         let valuable = isInteractivePageQuiet(response, responseText);
+        let hasBody = responseText && responseText.trim().length > 0;
+        
+        if (status >= 400){
+            // Even if status >= 400 (e.g. 500 Internal Server Error), 
+            // if the page has ANY response body, we consider it ok to save for fuzzing.
+            // (It may not be "valuable" for crawling, but it's valid for fuzzing).
+            if (hasBody) {
+                return {ok:true, valuable:valuable, status, redirected:false};
+            } else {
+                return {ok:false, valuable:false, status, redirected:false};
+            }
+        }
+        
         return {ok:true, valuable, status, redirected:false};
     } catch(ex){
         return {ok:false, valuable:false, status:0, redirected:false};

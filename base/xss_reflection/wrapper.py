@@ -105,7 +105,7 @@ def _find_fuzz_script(work_dir: str):
 def _fuzzer_dirs(work_dir: str):
     items = []
     for name in sorted(os.listdir(work_dir)):
-        if name == "fuzzer-master" or name.startswith("fuzzer-"):
+        if name == "fuzzer-master" or (name.startswith("fuzzer-") and name != "extsync"):
             path = os.path.join(work_dir, name)
             if os.path.isdir(path):
                 items.append(path)

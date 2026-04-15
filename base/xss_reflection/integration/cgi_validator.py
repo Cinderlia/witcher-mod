@@ -3,6 +3,8 @@ import os
 import re
 import shutil
 from typing import Dict, List, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 from .cgi_runner import CGIRunner
 
@@ -14,6 +16,7 @@ class CGISeedValidator:
         self.log_path = log_path or os.path.join(work_dir, "xss_reflection.log")
         self.token_pattern = re.compile(r"witcher_xss_\d{4}")
         self.runner = CGIRunner(work_dir)
+        self._log_lock = threading.Lock()
 
     def run(self) -> Dict[str, int]:
         script_path = self.runner.find_script()
@@ -24,12 +27,14 @@ class CGISeedValidator:
         if not cmd:
             self._log("Witcher-XSS CGI command not found")
             return {"executed": 0, "reflected": 0}
-        executed = 0
-        reflected = 0
-        for fuzzer_dir in self._fuzzer_dirs():
+        fuzzer_dirs = self._fuzzer_dirs()
+
+        def one(fuzzer_dir: str):
+            executed = 0
+            reflected = 0
             queue_root = os.path.join(fuzzer_dir, self.output_dir_name)
             if not os.path.isdir(queue_root):
-                continue
+                return 0, 0
             for seed_dir in self._seed_dirs(queue_root):
                 hits_dir = os.path.join(seed_dir, "hits")
                 responses_dir = os.path.join(seed_dir, "responses")
@@ -45,14 +50,26 @@ class CGISeedValidator:
                     body = self.runner.execute(cmd, env, seed_path)
                     executed += 1
                     self._write_response(responses_dir, seed_path, body)
-                    if not token:
-                        continue
-                    if token in body:
+                    if token and token in body:
                         shutil.copy2(seed_path, hits_dir)
                         self._write_response(hits_dir, seed_path, body)
                         reflected += 1
                 self._log(f"Witcher-XSS validated {seed_dir} executed={executed} reflected={reflected}")
-        return {"executed": executed, "reflected": reflected}
+            return executed, reflected
+
+        total_executed = 0
+        total_reflected = 0
+        max_workers = max(1, min(len(fuzzer_dirs), os.cpu_count() or 4))
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futs = [ex.submit(one, fd) for fd in (fuzzer_dirs or [])]
+            for fu in as_completed(futs):
+                try:
+                    exed, refl = fu.result()
+                except Exception:
+                    continue
+                total_executed += int(exed)
+                total_reflected += int(refl)
+        return {"executed": total_executed, "reflected": total_reflected}
 
     def _seed_dirs(self, queue_root: str) -> List[str]:
         items = []
@@ -96,7 +113,7 @@ class CGISeedValidator:
     def _fuzzer_dirs(self) -> List[str]:
         items = []
         for name in sorted(os.listdir(self.work_dir)):
-            if name == "fuzzer-master" or name.startswith("fuzzer-"):
+            if name == "fuzzer-master" or (name.startswith("fuzzer-") and name != "extsync"):
                 path = os.path.join(self.work_dir, name)
                 if os.path.isdir(path):
                     items.append(path)
@@ -104,8 +121,9 @@ class CGISeedValidator:
 
     def _log(self, message: str) -> None:
         print(f"[Witcher-XSS] {message}")
-        with open(self.log_path, "a", encoding="utf-8") as wf:
-            wf.write(message + "\n")
+        with self._log_lock:
+            with open(self.log_path, "a", encoding="utf-8") as wf:
+                wf.write(message + "\n")
 
 
 def validate_xss_seeds(work_dir: str, output_dir_name: str = "xss_queue") -> Dict[str, int]:

@@ -6,6 +6,7 @@ from phuzzer.reporter import Reporter
 if os.path.isdir("/xss_reflection") and "/" not in sys.path:
     sys.path.insert(0, "/")
 from xss_reflection.wrapper import run_xss_flow
+from .symex_launcher import start_symex_hybrid, stop_symex
 from urllib.parse import urlparse, urlunparse
 from datetime import datetime
 from phuzzer import Phuzzer
@@ -35,7 +36,7 @@ class Witcher():
 
     def __init__(self, args):
         random.seed(90210)
-        self.testloc = args.testloc # replaced BASETESTDIR
+        self.testloc = os.path.realpath(args.testloc) # replaced BASETESTDIR
         self.testver = args.testver
         self.dictionary_fn = os.path.join(self.testloc, self.testver,"dict.txt")
         self.seed_path = os.path.join(self.testloc, self.testver, "input")
@@ -49,6 +50,8 @@ class Witcher():
             raise ValueError(f"The configuration does not exist at {self.config_loc}, a configuration file is required")
 
         self.jconfig = json.load(open(self.config_loc,"r"))
+        if not self.appdir:
+            self.appdir = self.jconfig.get("appdir") or self.jconfig.get("app_dir") or self.jconfig.get("app_root") or "/app"
         self.fuzzer_target_binary = ""
         self.single_target = args.target
         self.use_reqr = False
@@ -91,6 +94,7 @@ class Witcher():
         self.kill = False
 
         self.saved_seeds = set()
+        self.symex_handle = None
 
         if args.container_name:
             self.container_info = {'name': args.container_name}
@@ -170,7 +174,7 @@ class Witcher():
         return env
 
     @staticmethod
-    def find_path(urlpath, prior_rootpaths):
+    def find_path(urlpath, prior_rootpaths, search_root=None):
         fname = os.path.basename(urlpath)
 
         for rootpath in prior_rootpaths:
@@ -178,16 +182,19 @@ class Witcher():
             if os.path.exists(tmppath):
                 return tmppath
 
-        cmd = ["find", "/", "-path", "/p", "-prune", "-o", "-path", "/proc", "-prune",
-               "-o", "-path", "/test", "-prune", "-o", "-path", "/etc", "-prune",
-               "-o", "-path", "/var/log", "-prune", "-o", "-path", "/var/spool", "-prune",
-               "-o", "-path", "/var/cache", "-prune",
-               "-o", "-path", "/var/lib", "-prune", "-o", "-path", "/root", "-prune",
-               "-o", "-name", fname]
+        if search_root:
+            cmd = ["find", search_root, "-name", fname]
+        else:
+            cmd = ["find", "/", "-path", "/p", "-prune", "-o", "-path", "/proc", "-prune",
+                   "-o", "-path", "/test", "-prune", "-o", "-path", "/etc", "-prune",
+                   "-o", "-path", "/var/log", "-prune", "-o", "-path", "/var/spool", "-prune",
+                   "-o", "-path", "/var/cache", "-prune",
+                   "-o", "-path", "/var/lib", "-prune", "-o", "-path", "/root", "-prune",
+                   "-o", "-name", fname]
 
         #print(f"Command = {' '.join(cmd)}")
 
-        p = subprocess.Popen(cmd, stdout=subprocess.PIPE)
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         results, _ = p.communicate()
         #print(f"RESULTS from find = {results}")
         for fpath in sorted(results.split(b'\n'), key=len):
@@ -210,6 +217,61 @@ class Witcher():
             start_time = datetime.now().strftime("%Y_%m_%d_%H_%M")
             self.fuzz_campaign_status.append({"trial_start": start_time, "trial_complete": False, "targets": []})
             trial = self.fuzz_campaign_status[trial_index]
+
+            probe_flag_file = "/tmp/witcher_route_probe.flag"
+            # We must use /tmp for the log file because the PHP process (e.g. www-data) might not have write access to the specific workspace directory
+            probe_log_file = "/tmp/witcher_url_mapping.log"
+            route_map = {}
+
+            # Fallback to wc_inst_interpreter_binary if afl_inst_interpreter_binary is not set or empty
+            interpreter_bin = self.jconfig.get("afl_inst_interpreter_binary", "")
+            if not interpreter_bin:
+                interpreter_bin = self.jconfig.get("wc_inst_interpreter_binary", "")
+
+            if interpreter_bin.find("php-cgi") > -1:
+                print(f"[WC] Enabling PHP route probe for {self.appdir}, saving to {probe_log_file}")
+                with open(probe_flag_file, "w") as f:
+                    # Write just the app directory for filtering
+                    f.write(self.appdir)
+                
+                if os.path.exists(probe_log_file):
+                    os.remove(probe_log_file)
+                
+                import requests
+                session = requests.Session()
+                unique_paths = set()
+                
+                print(f"[WC] Sending requests to trigger probe (ignoring query parameters to deduplicate)...")
+                for reqkey, req in self.request_data["requestsFound"].items():
+                    url_parsed = urlparse(req["_url"])
+                    # Use only the path for deduplication to reduce the number of probing requests
+                    if url_parsed.path not in unique_paths:
+                        unique_paths.add(url_parsed.path)
+                        try:
+                            # Reconstruct URL without query params for probing
+                            probe_url = urlunparse((url_parsed.scheme, url_parsed.netloc, url_parsed.path, '', '', ''))
+                            session.get(probe_url, timeout=2, verify=False)
+                        except requests.exceptions.RequestException:
+                            pass
+                
+                if os.path.exists(probe_log_file):
+                    with open(probe_log_file, "r") as f:
+                        for line in f:
+                            try:
+                                data = json.loads(line.strip())
+                                route_map[data['uri']] = data['script']
+                            except Exception as e:
+                                pass
+                    print(f"[WC] Probe collected {len(route_map)} mappings.")
+                else:
+                    print(f"[WC] Warning: Probe log {probe_log_file} was not created.")
+                
+                if os.path.exists(probe_flag_file):
+                    os.remove(probe_flag_file)
+                
+                # Delete the mapping log after reading it to keep the environment clean
+                if os.path.exists(probe_log_file):
+                    os.remove(probe_log_file)
 
             for reqkey, req in self.request_data["requestsFound"].items():
 
@@ -283,54 +345,82 @@ class Witcher():
                         #         print(
                         #             f"Skipping {url} because php-cgi being used to evaluate but request url is for non php item target_path={target_path}")
                         #         continue
-                        if self.jconfig.get("afl_inst_interpreter_binary", "").find("php-cgi") > -1:
+                        if interpreter_bin.find("php-cgi") > -1:
                             url = urlparse(req["_url"])
                             urlpath = url.path
                             
-                            # mod
-                            front_controllers = ['app.php', 'index.php', 'router.php', 'front.php', 'web.php']
-                            is_front_controller = False
-                            actual_script_path = urlpath
-                            
-                            # mod
-                            for controller in front_controllers:
-                                if f'/{controller}' in urlpath:
-                                    # mod
-                                    controller_index = urlpath.find(f'/{controller}')
-                                    if controller_index != -1:
-                                        # mod
-                                        actual_script_path = urlpath[:controller_index + len(f'/{controller}')]
-                                        is_front_controller = True
-                                        break
-                            
-                            if actual_script_path.startswith("/"):
-                                actual_script_path = actual_script_path[1:]
-                            
-                            # mod
-                            target_path = os.path.join(self.appdir, actual_script_path)
-                            print(f"target_path={target_path} (front_controller={is_front_controller})")
-                            
-                            # mod
-                            if not os.path.exists(target_path):
-                                found_path = Witcher.find_path(actual_script_path, last_rootpath)
-                                if found_path and os.path.exists(found_path):
-                                    target_path = found_path
+                            # mod: Check if the probe found the correct script path
+                            if urlpath in route_map:
+                                raw_target = route_map[urlpath]
+                                app_base_name = os.path.basename(self.appdir.rstrip('/'))
+                                
+                                # Map the absolute server path (e.g. /var/www/html/joomla/index.php) 
+                                # back to the Witcher container path (e.g. /app/joomla/index.php)
+                                idx = raw_target.find(f"/{app_base_name}/")
+                                if idx != -1:
+                                    target_path = os.path.join(self.appdir, raw_target[idx + len(f"/{app_base_name}/"):])
                                 else:
-                                    # mod
-                                    controller_file = os.path.basename(actual_script_path)
-                                    found_path = Witcher.find_path(controller_file, last_rootpath)
+                                    target_path = raw_target
+                                    
+                                # print(f"[WC] Probed target_path={target_path}")
+                                last_rootpath.add(os.path.dirname(target_path))
+                                is_front_controller = (target_path.endswith("index.php") or target_path.endswith("app.php") or target_path.endswith("router.php"))
+                            else:
+                                # mod
+                                front_controllers = ['app.php', 'index.php', 'router.php', 'front.php', 'web.php']
+                                is_front_controller = False
+                                actual_script_path = urlpath
+                                
+                                # mod
+                                for controller in front_controllers:
+                                    if f'/{controller}' in urlpath:
+                                        # mod
+                                        controller_index = urlpath.find(f'/{controller}')
+                                        if controller_index != -1:
+                                            # mod
+                                            actual_script_path = urlpath[:controller_index + len(f'/{controller}')]
+                                            is_front_controller = True
+                                            break
+                                
+                                if actual_script_path.startswith("/"):
+                                    actual_script_path = actual_script_path[1:]
+                                
+                                # mod
+                                target_path = os.path.join(self.appdir, actual_script_path)
+                                print(f"target_path={target_path} (front_controller={is_front_controller})")
+                                
+                                # mod
+                                if not os.path.exists(target_path):
+                                    found_path = Witcher.find_path(actual_script_path, last_rootpath, search_root=self.appdir)
                                     if found_path and os.path.exists(found_path):
                                         target_path = found_path
-                            
-                            if target_path:
-                                last_rootpath.add(target_path.replace(os.path.basename(actual_script_path), ""))
-                            
-                            # mod
-                            if (url.path.find(".php") == -1 and 
-                                not url.path.endswith("/") and 
-                                not is_front_controller): 
-                                print(f"Skipping {url} because php-cgi being used but request is for non-php item: target_path={target_path}")
-                                continue
+                                    else:
+                                        # mod
+                                        controller_file = os.path.basename(actual_script_path)
+                                        found_path = Witcher.find_path(controller_file, last_rootpath, search_root=self.appdir)
+                                        if found_path and os.path.exists(found_path):
+                                            target_path = found_path
+
+                                if (not is_front_controller and
+                                        url.path.find(".php") == -1 and
+                                        not url.path.endswith("/") and
+                                        actual_script_path.find("/") > -1):
+                                    first_dir = actual_script_path.split("/", 1)[0]
+                                    fc_candidate = os.path.join(self.appdir, first_dir, "index.php")
+                                    if os.path.exists(fc_candidate):
+                                        target_path = fc_candidate
+                                        is_front_controller = True
+                                        print(f"target_path={target_path} (front_controller=True)")
+                                
+                                if target_path:
+                                    last_rootpath.add(target_path.replace(os.path.basename(actual_script_path), ""))
+                                
+                                # mod
+                                if (url.path.find(".php") == -1 and 
+                                    not url.path.endswith("/") and 
+                                    not is_front_controller): 
+                                    print(f"Skipping {url} because php-cgi being used but request is for non-php item: target_path={target_path}")
+                                    continue
                         else:
                             target_path = req['_url']
 
@@ -374,32 +464,325 @@ class Witcher():
     def create_seeds(self, requests):
         seed_name_stub = os.path.join(self.seed_path,"seed-")
         seeds = []
-        if len(requests) > 50:
-            requests = requests[:10]
-        for reqkey in requests:
+        
+        # Parse all requests to filter out >10KB and compute parameter diversity
+        from urllib.parse import parse_qsl, urlencode
+        from difflib import SequenceMatcher
+        from typing import Dict, List, Optional, Tuple
 
+        def _to_str(x) -> str:
+            try:
+                return x if isinstance(x, str) else str(x)
+            except Exception:
+                return ""
+
+        def _parse_kv(s: str):
+            s = _to_str(s).strip()
+            if not s:
+                return []
+            try:
+                items = parse_qsl(s, keep_blank_values=True)
+            except Exception:
+                items = []
+            if items:
+                return items
+            if ";" in s and "=" in s:
+                try:
+                    s2 = s.replace(";", "&").replace(" ", "")
+                    return parse_qsl(s2, keep_blank_values=True)
+                except Exception:
+                    return []
+            return []
+
+        def _similarity(a: str, b: str) -> float:
+            a = _to_str(a).strip().lower()
+            b = _to_str(b).strip().lower()
+            if not a or not b:
+                return 0.0
+            if a == b:
+                return 1.0
+            if len(a) > 256:
+                a = a[:256]
+            if len(b) > 256:
+                b = b[:256]
+            try:
+                return float(SequenceMatcher(None, a, b).ratio())
+            except Exception:
+                return 0.0
+
+        def _is_fuzzy_seen(rep_list: List[str], s: str, threshold: float = 0.3) -> bool:
+            sv = _to_str(s).strip()
+            if not sv:
+                return True
+            for r in rep_list:
+                if _similarity(r, sv) >= float(threshold):
+                    return True
+            return False
+
+        def _fuzzy_add(rep_list: List[str], s: str, threshold: float = 0.3) -> bool:
+            sv = _to_str(s).strip()
+            if not sv:
+                return False
+            if _is_fuzzy_seen(rep_list, sv, threshold=float(threshold)):
+                return False
+            rep_list.append(sv)
+            return True
+
+        def _trim_params(s: str, *, max_keys: Optional[int] = None, max_val_len: Optional[int] = None, fuzzy_keys: bool = False) -> str:
+            items = _parse_kv(s)
+            if not items:
+                return _to_str(s)
+            if max_keys is not None and max_keys > 0 and len(items) > int(max_keys):
+                if fuzzy_keys:
+                    kept = []
+                    seen_key_reps: List[str] = []
+                    for k, v in items:
+                        ks = _to_str(k)
+                        if not _is_fuzzy_seen(seen_key_reps, ks, threshold=0.3):
+                            seen_key_reps.append(ks)
+                            kept.append((k, v))
+                            if len(kept) >= int(max_keys):
+                                break
+                    if len(kept) < int(max_keys):
+                        for k, v in items:
+                            if (k, v) in kept:
+                                continue
+                            kept.append((k, v))
+                            if len(kept) >= int(max_keys):
+                                break
+                    items = kept
+                else:
+                    items = items[: int(max_keys)]
+            if max_val_len is not None and max_val_len > 0:
+                out_items = []
+                lim = int(max_val_len)
+                for k, v in items:
+                    vs = _to_str(v)
+                    if len(vs) > lim:
+                        vs = vs[:lim]
+                    out_items.append((_to_str(k), vs))
+                items = out_items
+            try:
+                return urlencode(items)
+            except Exception:
+                return _to_str(s)
+
+        def _encode_seed(cookie_s: str, get_s: str, post_s: str, headers_s: str) -> bytes:
+            return b"%s\x00%s\x00%s\x00%s" % (
+                _to_str(cookie_s).encode("utf-8", errors="replace"),
+                _to_str(get_s).encode("utf-8", errors="replace"),
+                _to_str(post_s).encode("utf-8", errors="replace"),
+                _to_str(headers_s).encode("utf-8", errors="replace"),
+            )
+
+        def _shrink_to_limit(cookie_s: str, get_s: str, post_s: str, headers_s: str, limit: int) -> Optional[Tuple[str, str, str, str]]:
+            cookie_s = _to_str(cookie_s)
+            get_s = _to_str(get_s)
+            post_s = _to_str(post_s)
+            headers_s = _to_str(headers_s)
+
+            post_s = _trim_params(post_s, max_keys=10, max_val_len=64, fuzzy_keys=True)
+            cur = _encode_seed(cookie_s, get_s, post_s, headers_s)
+            if len(cur) <= int(limit):
+                return cookie_s, get_s, post_s, headers_s
+
+            headers_s = ""
+            cur = _encode_seed(cookie_s, get_s, post_s, headers_s)
+            if len(cur) <= int(limit):
+                return cookie_s, get_s, post_s, headers_s
+
+            cookie_s = _trim_params(cookie_s, max_keys=None, max_val_len=64)
+            cur = _encode_seed(cookie_s, get_s, post_s, headers_s)
+            if len(cur) <= int(limit):
+                return cookie_s, get_s, post_s, headers_s
+
+            get_s = _trim_params(get_s, max_keys=None, max_val_len=128)
+            cur = _encode_seed(cookie_s, get_s, post_s, headers_s)
+            if len(cur) <= int(limit):
+                return cookie_s, get_s, post_s, headers_s
+
+            get_items = _parse_kv(get_s)
+            if get_items:
+                low = 0
+                high = len(get_items)
+                while low < high:
+                    mid = (low + high) // 2
+                    g2 = ""
+                    try:
+                        g2 = urlencode(get_items[:mid])
+                    except Exception:
+                        g2 = get_s
+                    if len(_encode_seed(cookie_s, g2, post_s, headers_s)) <= int(limit):
+                        low = mid + 1
+                    else:
+                        high = mid
+                keep = max(0, low - 1)
+                try:
+                    get_s = urlencode(get_items[:keep])
+                except Exception:
+                    pass
+                cur = _encode_seed(cookie_s, get_s, post_s, headers_s)
+                if len(cur) <= int(limit):
+                    return cookie_s, get_s, post_s, headers_s
+
+            return None
+
+        parsed_reqs = []
+        for reqkey in requests:
             req = self.request_data["requestsFound"].get(reqkey,None)
             if req is None:
                 print(f"[Witcher]\033[32m Did not find {reqkey} in request data. \033[0m")
                 continue
-                #req = self.request_data["requestsFound"].get(reqkey, None)
 
-            strid = req["_id"]
             url = urlparse(req["_url"])
+            cookie_s = req.get('_cookieData','')
+            get_s = url.query
+            post_s = req.get('_postData','')
+            
+            post_s = _trim_params(post_s, max_keys=10, max_val_len=64, fuzzy_keys=True)
 
-            cookie_data = req.get('_cookieData','').encode("utf-8")
-            urlquery = url.query.encode("utf-8")
-            post_data = req.get('_postData','').encode("utf-8")
-
-            headers = req.get('_headers','')
+            headers = req.get('_headers', {})
             headers_out = ""
+            ignore_headers = {"HOST", "CONTENT-LENGTH", "CONNECTION", "COOKIE", "ACCEPT-ENCODING"}
             for k,v in headers.items():
-                if k.upper() == "SOAPACTION" or k.upper() == "HNAP_AUTH":
-                    headers_out += f"{k}:{v}\n"
+                if k.upper() not in ignore_headers:
+                    headers_out += f"{k}: {v}\n"
 
-            strout = b"%s\x00%s\x00%s\x00%s" % (cookie_data, urlquery, post_data, headers_out.encode('utf-8'))
-            if len(strout) > 3:
-                seeds.append(strout)
+            shrunk = _shrink_to_limit(cookie_s, get_s, post_s, headers_out, 10240)
+            if not shrunk:
+                continue
+            cookie_s, get_s, post_s, headers_out = shrunk
+            strout = _encode_seed(cookie_s, get_s, post_s, headers_out)
+            
+            # Filter out seeds that are > 10KB or empty
+            if len(strout) <= 3 or len(strout) > 10240:
+                continue
+                
+            # Extract keys for diversity scoring
+            get_pairs = [(str(k), str(v)) for k, v in _parse_kv(get_s)]
+            keys_get = {k for k, _ in get_pairs}
+            keys_cookie = {k for k, _ in _parse_kv(cookie_s)}
+            post_pairs = [(str(k), str(v)) for k, v in _parse_kv(post_s)]
+            post_key_reps: List[str] = []
+            for k, _v in post_pairs:
+                _fuzzy_add(post_key_reps, k, threshold=0.3)
+            keys_post = set(post_key_reps)
+            get_value_reps_by_key: Dict[str, List[str]] = {}
+            for k, v in get_pairs:
+                lst = get_value_reps_by_key.get(k)
+                if lst is None:
+                    lst = []
+                    get_value_reps_by_key[k] = lst
+                _fuzzy_add(lst, v, threshold=0.3)
+            get_value_rep_count = 0
+            for _k, lst in get_value_reps_by_key.items():
+                get_value_rep_count += len(lst or [])
+            keys = set(keys_get) | set(keys_cookie) | set(keys_post)
+            
+            # Skip requests with absolutely no parameters
+            if len(keys) == 0:
+                continue
+                
+            parsed_reqs.append({
+                'strout': strout,
+                'keys': keys,
+                'key_count': len(keys),
+                'keys_get': keys_get,
+                'get_pairs': get_pairs,
+                'get_value_reps_by_key': get_value_reps_by_key,
+                'get_value_rep_count': int(get_value_rep_count),
+                'keys_cookie': keys_cookie,
+                'keys_post': keys_post,
+                'post_key_reps': post_key_reps,
+            })
+
+        # If we have more than 50 seeds, select the 50 most diverse ones
+        if len(parsed_reqs) > 50:
+            parsed_reqs.sort(
+                key=lambda x: (
+                    len(x.get('keys_get') or []),
+                    int(x.get('get_value_rep_count') or 0),
+                    len(x.get('keys_cookie') or []),
+                    len(x.get('keys_post') or []),
+                    x['key_count'],
+                ),
+                reverse=True,
+            )
+            
+            selected_reqs = [parsed_reqs[0]] # Always take the one with the most keys
+            seen_get = set(parsed_reqs[0].get('keys_get') or set())
+            seen_get_value_reps: Dict[str, List[str]] = {}
+            for k, lst in (parsed_reqs[0].get('get_value_reps_by_key') or {}).items():
+                if not isinstance(k, str):
+                    continue
+                if not isinstance(lst, list):
+                    continue
+                seen_get_value_reps[str(k)] = [str(x) for x in lst if isinstance(x, str)]
+            seen_cookie = set(parsed_reqs[0].get('keys_cookie') or set())
+            seen_post_reps: List[str] = []
+            for k in (parsed_reqs[0].get('post_key_reps') or []):
+                if isinstance(k, str):
+                    _fuzzy_add(seen_post_reps, k, threshold=0.3)
+            
+            # Greedily select seeds that add the most NEW keys
+            while len(selected_reqs) < 50:
+                best_req = None
+                best_new_keys_count = -1
+                
+                for req in parsed_reqs:
+                    if req in selected_reqs:
+                        continue
+                    ng = (req.get('keys_get') or set()) - seen_get
+                    nc = (req.get('keys_cookie') or set()) - seen_cookie
+                    new_get_vals = 0
+                    gv = req.get('get_value_reps_by_key') or {}
+                    if isinstance(gv, dict):
+                        for k, lst in gv.items():
+                            if not isinstance(k, str) or not isinstance(lst, list):
+                                continue
+                            seen_lst = seen_get_value_reps.get(k) or []
+                            for v in lst:
+                                if not isinstance(v, str):
+                                    continue
+                                if not _is_fuzzy_seen(seen_lst, v, threshold=0.3):
+                                    new_get_vals += 1
+                    new_post_keys = 0
+                    for pk in (req.get('post_key_reps') or []):
+                        if isinstance(pk, str) and not _is_fuzzy_seen(seen_post_reps, pk, threshold=0.3):
+                            new_post_keys += 1
+                    score = len(ng) * 100000000 + int(new_get_vals) * 10000 + len(nc) * 100 + int(new_post_keys)
+                    if int(score) > best_new_keys_count:
+                        best_new_keys_count = int(score)
+                        best_req = req
+                        
+                # If no new keys can be found, just take the next largest one
+                if best_req is None or best_new_keys_count == 0:
+                    for req in parsed_reqs:
+                        if req not in selected_reqs:
+                            best_req = req
+                            break
+                            
+                selected_reqs.append(best_req)
+                seen_get.update(best_req.get('keys_get') or set())
+                for k, lst in (best_req.get('get_value_reps_by_key') or {}).items():
+                    if not isinstance(k, str) or not isinstance(lst, list):
+                        continue
+                    bucket = seen_get_value_reps.get(k)
+                    if bucket is None:
+                        bucket = []
+                        seen_get_value_reps[k] = bucket
+                    for v in lst:
+                        if isinstance(v, str):
+                            _fuzzy_add(bucket, v, threshold=0.3)
+                seen_cookie.update(best_req.get('keys_cookie') or set())
+                for pk in (best_req.get('post_key_reps') or []):
+                    if isinstance(pk, str):
+                        _fuzzy_add(seen_post_reps, pk, threshold=0.3)
+                
+            parsed_reqs = selected_reqs
+
+        seeds = [req['strout'] for req in parsed_reqs]
+        
         if len(seeds) == 0:
             seeds.append(b"cookie=flour\x00query=search\x00post=hole")
         return seeds
@@ -409,13 +792,51 @@ class Witcher():
         inputlist = self.request_data["inputSet"]
         if f"inputSet-{target}" in self.request_data:
             inputlist = inputlist + self.request_data[f"inputSet-{target}"]
-        for inputvar in inputlist:
-            if len(inputvar) > 127:
+        extras = set()
+
+        req_keys = (target or {}).get("requests") if isinstance(target, dict) else None
+        for reqkey in req_keys or []:
+            req = self.request_data["requestsFound"].get(reqkey)
+            if not isinstance(req, dict):
                 continue
-            if inputvar.find("&") == len(inputvar) -1:
-                inputvar = inputvar[:-1]
-            dictionary_vars.append(b"%s&" % inputvar.encode("utf-8"))
-#            dictionary_vars.append(b"%s'(&" % inputvar.encode("utf-8"))
+            try:
+                url = urlparse(req.get("_url") or "")
+            except Exception:
+                continue
+            q = (url.query or "").strip()
+            if not q:
+                continue
+            q2 = q.replace(";", "&")
+            for part in q2.split("&"):
+                s = (part or "").strip()
+                if not s:
+                    continue
+                if "=" in s:
+                    ks, vs = s.split("=", 1)
+                else:
+                    ks, vs = s, ""
+                ks = (ks or "").strip()
+                vs = (vs or "").strip()
+                if ks:
+                    extras.add(ks)
+                    extras.add(ks + "=")
+                if vs:
+                    if len(vs) > 64:
+                        vs = vs[:64]
+                    extras.add(vs)
+                if ks and vs:
+                    extras.add(f"{ks}={vs}")
+
+        for inputvar in list(inputlist or []) + sorted(extras):
+            try:
+                s = inputvar if isinstance(inputvar, str) else str(inputvar)
+            except Exception:
+                continue
+            if len(s) > 127:
+                continue
+            if s.find("&") == len(s) - 1:
+                s = s[:-1]
+            dictionary_vars.append(b"%s&" % s.encode("utf-8", errors="replace"))
         print(f"Wrote out dictionary vars {len(inputlist)} totals bytes {len(dictionary_vars)} {dictionary_vars[0]}")
 
         #open(self.dictionary_fn,"w").write(dictionary_vars)
@@ -633,19 +1054,44 @@ class Witcher():
             os.environ["PATH_INFO"] = path_info
             print(f"Setting PATH_INFO: {path_info}")
 
-
-        with open("/tmp/start_test.dat","w") as wf:
-            wf.write("Trace me if you can, little one.")
-
         if target_path.startswith("http"):
             binary_options = self.change_url_to_target(target_path)
             print(f"NEW BIN OPTS {binary_options}")
         else:
             binary_options = self.binary_options
 
+        # --- Dynamic Fuzz Time Initialization ---
+        base_time = self.timeout
+        num_seeds = len(seeds) if seeds else 0
+
+        if hasattr(self, 'global_timeout') and self.global_timeout > 0 and getattr(self, 'current_allocated_time', None) is not None:
+            dynamic_timeout = self.current_allocated_time
+            if getattr(self, 'is_last_target', False):
+                print(f"[*] Last target, adding all remaining extra fuzz time: {self.extra_fuzz_time:.0f}s")
+                dynamic_timeout += self.extra_fuzz_time
+                self.extra_fuzz_time = 0
+            
+            check_interval = dynamic_timeout * 0.1
+            half_check_interval = dynamic_timeout * 0.05
+            time_adjustment = dynamic_timeout * 0.05
+            max_allowed_time = dynamic_timeout * 2.5
+        else:
+            # 初始分配：1个seed给10%，但保底20%（防止AFL还没校准完就被杀），上限150%
+            initial_ratio = min(max(0.1 * num_seeds, 0.2), 1.5)
+            dynamic_timeout = base_time * initial_ratio
+            check_interval = base_time * 0.1
+            half_check_interval = base_time * 0.05
+            time_adjustment = base_time * 0.05
+            max_allowed_time = base_time * 2.5
+
+        last_check_time = 0
+        last_paths_total = 0
+        half_check_done = False
+        # ----------------------------------------
+
         fuzzer = Phuzzer.phactory(phuzzer_type=Phuzzer.WITCHER_AFL, target=self.fuzzer_target_binary, target_opts=binary_options,
                                   work_dir=self.work_dir, seeds=seeds, afl_count=self.cores,
-                                  create_dictionary=False, timeout=self.timeout, memory=self.memory,
+                                  create_dictionary=False, timeout=dynamic_timeout, memory=self.memory,
                                   run_timeout=self.run_timeout, dictionary=dictionary_str,
                                   use_qemu=self.use_qemu, resume=do_resume, login_json_fn=self.config_loc,
                                   base_port=self.server_base_port, container_info=self.container_info, fault_escalation=not self.no_fault_escalation)
@@ -660,11 +1106,18 @@ class Witcher():
 
         start_results = {"totalfail": False, "timeout": False }
         reporter = Reporter(self.fuzzer_target_binary, self.report_dir, self.cores, self.first_crash, self.timeout,
-                            fuzzer.work_dir, chown_files=chown_files)
+                            fuzzer.work_dir, chown_files=chown_files, fuzzer=fuzzer)
 
         reporter.set_script_filename(target_path)
 
         fuzzer.start()
+        self.symex_handle = start_symex_hybrid(
+            work_dir=self.work_dir,
+            config_path=self.config_loc,
+            request_data_path=self.request_data_fn,
+            trace_timeout=int(self.jconfig.get("symex_trace_timeout", 30)),
+            enabled=bool(self.jconfig.get("symex_enabled", True)),
+        )
 
         reporter.start()
         print("Starting Reporter...")
@@ -694,6 +1147,7 @@ class Witcher():
 
                     if successcnt + len(start_results['failedseeds']) == self.cores or (run_time > 120 and logfilesize > 0) or run_time > 300:
                         verified_start = True
+                        last_check_time = run_time # Reset check timer
                         if result_storage_pathname and (failedseeds or weakseeds):
                             seeds_to_scan = set()
                             seeds_to_scan |= failedseeds
@@ -713,6 +1167,49 @@ class Witcher():
                             start_results["totalfail"] = False
                     else:
                         start_results["totalfail"] = False
+
+                else:
+                    # --- Dynamic Fuzz Time Adjustment ---
+                    if not half_check_done and run_time >= half_check_interval:
+                        half_check_done = True
+                        try:
+                            stats = fuzzer.stats
+                            last_paths_total = sum(int(f.get('paths_total', 0)) for f in stats.values())
+                            print(f"\n[*] Dynamic Fuzz: 5% checkpoint. Initial paths = {last_paths_total}")
+                        except Exception:
+                            pass
+
+                    if run_time - last_check_time >= check_interval:
+                        last_check_time = run_time
+                        try:
+                            stats = fuzzer.stats
+                            current_paths_total = sum(int(f.get('paths_total', 0)) for f in stats.values())
+
+                            if current_paths_total > last_paths_total:
+                                if hasattr(self, 'global_timeout') and self.global_timeout > 0:
+                                    if self.extra_fuzz_time > 0:
+                                        actual_adjustment = min(time_adjustment, self.extra_fuzz_time)
+                                        fuzzer.timeout = min(fuzzer.timeout + actual_adjustment, max_allowed_time)
+                                        self.extra_fuzz_time -= actual_adjustment
+                                        print(f"\n[*] Dynamic Fuzz: Paths grew ({last_paths_total} -> {current_paths_total}). Timeout increased by {actual_adjustment:.0f}s to {fuzzer.timeout:.0f}s (Remaining extra: {self.extra_fuzz_time:.0f}s)")
+                                    else:
+                                        print(f"\n[*] Dynamic Fuzz: Paths grew ({last_paths_total} -> {current_paths_total}). No extra time available, timeout unchanged.")
+                                else:
+                                    fuzzer.timeout = min(fuzzer.timeout + time_adjustment, max_allowed_time)
+                                    print(f"\n[*] Dynamic Fuzz: Paths grew ({last_paths_total} -> {current_paths_total}). Timeout increased to {fuzzer.timeout:.0f}s (Max {max_allowed_time:.0f}s)")
+                            elif current_paths_total > 0:
+                                old_timeout = fuzzer.timeout
+                                fuzzer.timeout = fuzzer.timeout - time_adjustment
+                                if hasattr(self, 'global_timeout') and self.global_timeout > 0:
+                                    self.extra_fuzz_time += (old_timeout - fuzzer.timeout)
+                                    print(f"\n[*] Dynamic Fuzz: Paths stalled at {current_paths_total}. Timeout decreased to {fuzzer.timeout:.0f}s. Added to extra time (Total extra: {self.extra_fuzz_time:.0f}s)")
+                                else:
+                                    print(f"\n[*] Dynamic Fuzz: Paths stalled at {current_paths_total}. Timeout decreased to {fuzzer.timeout:.0f}s")
+
+                            last_paths_total = current_paths_total
+                        except Exception:
+                            pass
+                    # ------------------------------------
 
                 if not crash_seen and fuzzer.found_crash():
                     chown_files()
@@ -745,10 +1242,16 @@ class Witcher():
             raise
         finally:
             print("[*] Terminating fuzzer.")
+            if hasattr(self, 'global_timeout') and self.global_timeout > 0:
+                unused_time = max(0, fuzzer.timeout - run_time)
+                if unused_time > 0:
+                    self.extra_fuzz_time += unused_time
+                    print(f"[*] Fuzzer finished early. Added {unused_time:.0f}s to extra time (Total extra: {self.extra_fuzz_time:.0f}s)")
             chown_files()
+            stop_symex(self.symex_handle)
+            self.symex_handle = None
             reporter.stop()
             fuzzer.stop()
-            os.system("rm -f /tmp/start_test.dat")
             if self.kill:
                 exit(199)
         return start_results
@@ -1017,7 +1520,42 @@ class Witcher():
                 targets = trial["targets"].copy()
                 print(f"Trial start = {trial['trial_start']}")
 
-                if self.jconfig["script_random_order"] == 1:
+                self.global_timeout = int(self.jconfig.get("global_timeout", 0))
+                if self.global_timeout > 0:
+                    self.extra_fuzz_time = 0.0
+                    valid_targets = []
+                    t_start = self.jconfig.get("script_start_index", 0)
+                    t_end = self.jconfig.get("script_end_index", len(targets))
+                    for t in targets[t_start:t_end]:
+                        if self.single_target and t['target_path'].find(self.single_target) == -1:
+                            continue
+                        if self.target_contains_skiplist_value(t['target_path']):
+                            continue
+                        valid_targets.append(t)
+                    
+                    for t in valid_targets:
+                        t['_seed_count'] = len(self.create_seeds(t.get("requests", [])))
+                    
+                    valid_targets.sort(key=lambda x: x['_seed_count'])
+                    
+                    total_seeds = sum(t['_seed_count'] for t in valid_targets)
+                    effective_global_timeout = self.global_timeout / max(1, nbr_refuzzes)
+                    if total_seeds == 0:
+                        total_seeds = max(1, len(valid_targets))
+                        for t in valid_targets:
+                            t['_allocated_time'] = effective_global_timeout / total_seeds
+                    else:
+                        for t in valid_targets:
+                            t['_allocated_time'] = (t['_seed_count'] / total_seeds) * effective_global_timeout
+                    
+                    targets = valid_targets
+                    self.jconfig["script_start_index"] = 0
+                    self.jconfig["script_end_index"] = len(targets)
+                    if self.jconfig.get("script_random_order"):
+                        print("[*] global_timeout is set, disabling script_random_order to prioritize fewer seeds first.")
+                        self.jconfig["script_random_order"] = 0
+
+                if self.jconfig.get("script_random_order") == 1:
                     random.shuffle(targets)
 
                 self.start_external_servers()
@@ -1028,7 +1566,10 @@ class Witcher():
                     target_start = self.jconfig.get("script_start_index", 0)
                     target_end = self.jconfig.get("script_end_index", len(targets))
 
-                    for target in targets[target_start: target_end]:
+                    sliced_targets = targets[target_start: target_end]
+                    for i, target in enumerate(sliced_targets):
+                        self.is_last_target = (i == len(sliced_targets) - 1)
+                        self.current_allocated_time = target.get('_allocated_time')
 
                         if self.single_target and target['target_path'].find(self.single_target) == -1: # if using single target and not in target name then skip
                             continue

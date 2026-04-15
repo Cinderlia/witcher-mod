@@ -22,7 +22,7 @@ def main():
     parm_or_env("WC_TESTLOC", "testloc","the directory path with data about what's to be fuzzed ", parser, default=os.curdir)
     parm_or_env("WC_TESTVER", "testver", "Shortcut abbreviation for which configuration to use.", parser, "WICHR")
     parser.add_argument("--config", help="Name of config file for fuzzing session default is witcher_config.json",default="witcher_config.json")
-    parser.add_argument("--appdir", help="Config file for fuzzing session", default="/app")
+    parser.add_argument("--appdir", help="Application root directory. If omitted, uses appdir from config file (fallback /app).", default=None)
     parser.add_argument("--no-run","--no_run", action="store_true", default=(os.environ.get("WC_NO_RUN", "0")!="0"))
     parser.add_argument("-c","--cores", help="Config file for fuzzing session", default=int(os.environ.get("WC_CORES", "-1")))
     parser.add_argument("-t", "--timeout", help="Timeout for entire fuzzing session", type=float,

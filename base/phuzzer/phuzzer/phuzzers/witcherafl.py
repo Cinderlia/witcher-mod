@@ -624,10 +624,17 @@ class WitcherAFL(AFL):
                 authdata = self._extract_authdata(headers, loginconfig)
 
                 if self.relog:
-                    p = Process(target=self._do_relog, args=(loginconfig, ipaddress, self.running_flag))
-                    p.start()
-                    print("[Witcher] Started relog process")
-                    self.relog_process = p
+                    rp = getattr(self, "relog_process", None)
+                    alive = False
+                    try:
+                        alive = bool(rp is not None and rp.is_alive())
+                    except Exception:
+                        alive = False
+                    if not alive:
+                        p = Process(target=self._do_relog, args=(loginconfig, ipaddress, self.running_flag))
+                        p.start()
+                        print("[Witcher] Started relog process")
+                        self.relog_process = p
 
                 print(f"[*] Authorized data = {authdata}")
                 WitcherAFL._do_authorized_requests(loginconfig, authdata)
@@ -645,7 +652,7 @@ class WitcherAFL(AFL):
             my_env[authname] = authvalue
 
     def _do_relog(self, loginconfig, ipaddress, running_flag):
-        while running_flag:
+        while bool(getattr(running_flag, "value", running_flag)):
             self._do_httpreqr_login(loginconfig, ipaddress, relogging=True)
             time.sleep(30)
 
@@ -663,7 +670,26 @@ class WitcherAFL(AFL):
         return ""
 
     def stop(self):
-        self.running_flag = False
+        try:
+            self.running_flag.value = False
+        except Exception:
+            self.running_flag = False
+        try:
+            p = getattr(self, "relog_process", None)
+            if p is not None:
+                try:
+                    if p.is_alive():
+                        p.join(timeout=2)
+                except Exception:
+                    pass
+                try:
+                    if p.is_alive():
+                        p.terminate()
+                        p.join(timeout=2)
+                except Exception:
+                    pass
+        except Exception:
+            pass
         super().stop()
 
 

@@ -16,6 +16,100 @@ var BASE_SITE = "";
 var BASE_APPDIR = "";
 var RUNCNT = "";
 
+function wcStartupLog(baseAppdir, msg){
+    try{
+        let fn = path.join(baseAppdir, "crawler_startup.log");
+        let line = `[${(new Date()).toISOString()}] ${msg}\n`;
+        fs.appendFileSync(fn, line, {encoding:"utf8"});
+    } catch(ex){
+    }
+}
+
+function wcInitRuntimeLogger(baseAppdir){
+    try{
+        let fn = path.join(baseAppdir, "crawler_runtime.log");
+        let stream = fs.createWriteStream(fn, {flags:"a"});
+        let origLog = console.log;
+        let origErr = console.error;
+        let safeRepr = (v) => {
+            try{
+                if (v === null){
+                    return "null";
+                }
+                if (typeof v === "string"){
+                    return v;
+                }
+                if (typeof v === "number" || typeof v === "boolean" || typeof v === "bigint"){
+                    return String(v);
+                }
+                if (v instanceof Error){
+                    return (v && v.stack) ? v.stack : String(v);
+                }
+                if (typeof v === "undefined"){
+                    return "undefined";
+                }
+                if (typeof v === "function"){
+                    return "[Function]";
+                }
+                if (typeof v === "object"){
+                    let name = "";
+                    try{
+                        name = v && v.constructor && v.constructor.name ? v.constructor.name : "";
+                    } catch(ex){
+                        name = "";
+                    }
+                    // For simple objects, stringify them to capture data (like {msg: "error"} )
+                    if (name === "Object" || name === "") {
+                        try {
+                            return JSON.stringify(v);
+                        } catch (e) {
+                            return "[Unserializable Object]";
+                        }
+                    }
+                    return name ? `[${name}]` : "[Object]";
+                }
+                return String(v);
+            } catch(ex){
+                return "[Unserializable]";
+            }
+        };
+        let writeLine = (line) => {
+            try{
+                stream.write(`[${(new Date()).toISOString()}] ${line}\n`);
+            } catch(ex){
+            }
+        };
+        console.log = (...args) => {
+            try{
+                writeLine(args.map(safeRepr).join(" "));
+            } catch(ex){
+            }
+            origLog(...args);
+        };
+        console.error = (...args) => {
+            try{
+                writeLine(args.map(safeRepr).join(" "));
+            } catch(ex){
+            }
+            origErr(...args);
+        };
+        process.on("uncaughtException", (err) => {
+            try{
+                writeLine(`uncaughtException ${(err && err.stack) ? err.stack : String(err)}`);
+            } catch(ex){
+            }
+        });
+        process.on("unhandledRejection", (reason) => {
+            try{
+                writeLine(`unhandledRejection ${(reason && reason.stack) ? reason.stack : String(reason)}`);
+            } catch(ex){
+            }
+        });
+        writeLine("logger_ready");
+    } catch(ex){
+    }
+}
+
 // buildRequest consumes url and returns
 // it does this by spliting the path on / and reversing the results.  Starting with the last value it
 // finds the longest path that exists based on the provided path.
@@ -143,6 +237,14 @@ async function explorationWorker(workernum, appData){
     }
     let nextRequest = appData.getNextRequest();
     while (nextRequest != null){
+        try{
+            let stopFn = path.join(BASE_APPDIR, "STOP_CRAWLER");
+            if (fs.existsSync(stopFn)){
+                console.log("[WC] STOP_CRAWLER file detected, exiting");
+                process.exit(97);
+            }
+        } catch(ex){
+        }
 
         let re = new RequestExplorer(appData, workernum, BASE_APPDIR, nextRequest);
         await re.start();
@@ -206,6 +308,16 @@ if (process.argv.length > 3) {
     BASE_SITE = args[0];
     BASE_APPDIR = args[1];
     RUNCNT = args.length > 2 ? args[2] : "";
+    wcInitRuntimeLogger(BASE_APPDIR);
+    try{
+        console.log(`[WC][START] base_site=${BASE_SITE} base_appdir=${BASE_APPDIR} cwd=${process.cwd()}`);
+        wcStartupLog(BASE_APPDIR, `[WC][START] base_site=${BASE_SITE} base_appdir=${BASE_APPDIR} cwd=${process.cwd()}`);
+        let rd = path.join(BASE_APPDIR, "request_data.json");
+        let afl = path.join(BASE_APPDIR, "afl_request_data.json");
+        console.log(`[WC][START] request_data_exists=${fs.existsSync(rd)} afl_request_data_exists=${fs.existsSync(afl)}`);
+        wcStartupLog(BASE_APPDIR, `[WC][START] request_data_exists=${fs.existsSync(rd)} afl_request_data_exists=${fs.existsSync(afl)}`);
+    } catch(ex){
+    }
     var files_fn = path.join(BASE_APPDIR, "files.dat");
     var SEED_DIR = path.join(BASE_APPDIR, "input");
 
