@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence
 
@@ -110,9 +111,41 @@ class PhpFileTree:
     def _iter_php_files(self, root: Path) -> Iterable[Path]:
         if not root.exists():
             return
-        for p in root.rglob("*"):
-            if not p.is_file():
-                continue
-            if p.suffix.lower() != ".php":
-                continue
-            yield p
+        skip_dirnames = {
+            ".git",
+            ".hg",
+            ".svn",
+            ".idea",
+            ".vscode",
+            "__pycache__",
+            "node_modules",
+            "vendor",
+            "bower_components",
+            "third_party",
+            "third-party",
+            "thirdparty",
+            "external",
+            "externals",
+            "deps",
+            "dep",
+            "dist",
+            "build",
+            "out",
+            "target",
+            "coverage",
+            "docs",
+            "doc",
+            "tmp",
+            "temp",
+            "cache",
+            "logs",
+            "log",
+            "runtime",
+            "storage",
+        }
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if d.lower() not in skip_dirnames]
+            for fn in filenames:
+                if not fn.lower().endswith(".php"):
+                    continue
+                yield Path(dirpath) / fn

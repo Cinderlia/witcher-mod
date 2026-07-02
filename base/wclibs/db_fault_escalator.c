@@ -34,48 +34,260 @@ struct test_process_info {
 };
 
 
+int jdbc_error_check(unsigned char *cptr, size_t len);
 void print_repr(FILE *fp, unsigned char *cptr, size_t len);
+bool pattern_in_bytes(unsigned char *target, int target_len, unsigned char *pattern, int pattern_len);
+void mysql_error_check(unsigned char *cptr, size_t len);
 void error_report(unsigned char *cptr, size_t len);
+void command_error_report(unsigned char *cptr, size_t len);
+void error_report_with_type(unsigned char *cptr, size_t len, const char *error_type, const char *missing_strict_msg);
+void send_signal(int strictval, const char *error_type);
+bool has_non_ascii_bytes(const char *line);
+bool token_has_non_ascii(const char *start, size_t len);
+void inspect_stream_file(const char *path, bool allow_report);
+void inspect_one_line(const char *line, bool allow_report);
 
-static ssize_t (*real_write)(int fd, const void *buf, size_t count) = NULL;
-static ssize_t (*real_writev)(int fd, const struct iovec *iov, int iovcnt) = NULL;
+static ssize_t (*real_recv)(int sockfd, void *buf, size_t len, int flags) = NULL;
 static const char *fault_log_path = "/tmp/witcher_fault_escalator.log";
 static char stderr_path_cache[PATH_MAX] = {0};
 
-void refresh_stderr_path(void){
+ssize_t recv(int sockfd, void *buf, size_t len, int flags){
+  real_recv = dlsym(RTLD_NEXT, "recv");
+  ssize_t results = real_recv(sockfd, buf, len, flags);
+
+  if (buf && results > 0){
+    unsigned char *cptr = (unsigned char *)(buf);
+    jdbc_error_check(cptr, (size_t)results);
+    mysql_error_check(cptr, (size_t)results);
+  }
+
+  return results;
+}
+
+bool pattern_in_bytes(unsigned char *target, int target_len, unsigned char *pattern, int pattern_len){
+  if (target_len <= pattern_len){
+      return false;
+  }
+  for (int i = 0; i < target_len - pattern_len; i++) {
+      bool found = true;
+      for (int j = 0; j < pattern_len; j++) {
+
+          if (pattern[j] == '.'){
+              i++;
+              continue;
+          } else if (pattern[j] == '~'){
+            if (target[i] >= 0x20 && target[i] < 0x7f) {
+                while (target[i] >= 0x20 && target[i] < 0x7f) {
+                  i++;
+                }
+                continue;
+                found = false;
+                break;
+            }
+          }
+
+          if (target[i] != pattern[j]){
+              found = false;
+              break;
+          }
+
+          i++;
+      }
+      if (found){
+          return true;
+      }
+
+  }
+
+  return false;
+}
+
+bool has_shell_prefix(const char *line){
+  if (!line){
+    return false;
+  }
+  return strstr(line, "sh:") || strstr(line, "bash:") || strstr(line, "dash:") || strstr(line, "ash:");
+}
+
+bool has_shell_metachar(const char *line){
+  if (!line){
+    return false;
+  }
+  if (strstr(line, "$(") || strstr(line, "${") || strstr(line, "`")){
+    return true;
+  }
+  if (strstr(line, "&&") || strstr(line, "||") || strstr(line, ">>") || strstr(line, "<<")){
+    return true;
+  }
+  if (strstr(line, ";") || strstr(line, "|")){
+    return true;
+  }
+  return false;
+}
+
+bool has_non_ascii_bytes(const char *line){
+  if (!line){
+    return false;
+  }
+  const unsigned char *p = (const unsigned char *)line;
+  while (*p){
+    if (*p >= 0x80){
+      return true;
+    }
+    p++;
+  }
+  return false;
+}
+
+bool has_exposed_shell_chars(const char *line){
+  if (!line){
+    return false;
+  }
+  if (has_non_ascii_bytes(line)){
+    return true;
+  }
+  if (strstr(line, "'") || strstr(line, "\"") || strstr(line, "`")){
+    return true;
+  }
+  if (strstr(line, "$(") || strstr(line, "${")){
+    return true;
+  }
+  if (strstr(line, "&&") || strstr(line, "||")){
+    return true;
+  }
+  if (strstr(line, ";") || strstr(line, "|") || strstr(line, "<") || strstr(line, ">")){
+    return true;
+  }
+  if (strstr(line, "\\") || strstr(line, "(") || strstr(line, ")")){
+    return true;
+  }
+  return false;
+}
+
+bool token_has_non_ascii(const char *start, size_t len){
+  if (!start || len == 0){
+    return false;
+  }
+  for (size_t i = 0; i < len; i++){
+    if (((const unsigned char *)start)[i] >= 0x80){
+      return true;
+    }
+  }
+  return false;
+}
+
+bool token_has_shell_metachar(const char *start, size_t len){
+  if (!start || len == 0){
+    return false;
+  }
+  for (size_t i = 0; i < len; i++){
+    unsigned char c = (unsigned char)start[i];
+    if (c == ';' || c == '|' || c == '&' || c == '`' || c == '$' || c == '(' || c == ')' || c == '<' || c == '>'){
+      return true;
+    }
+  }
+  return false;
+}
+
+bool has_shell_syntax_context(const char *line){
+  if (!line){
+    return false;
+  }
+  if (!has_shell_prefix(line)){
+    return false;
+  }
+  if (has_exposed_shell_chars(line) || has_shell_metachar(line)){
+    return true;
+  }
+  if (strstr(line, "unexpected EOF") || strstr(line, "Unexpected EOF")){
+    return true;
+  }
+  if (strstr(line, "end of file unexpected") || strstr(line, "End of file unexpected")){
+    return true;
+  }
+  if (strstr(line, "looking for matching") || strstr(line, "Looking for matching")){
+    return true;
+  }
+  if (strstr(line, "Unterminated quoted string") || strstr(line, "unterminated quoted string")){
+    return true;
+  }
+  return false;
+}
+
+bool has_suspicious_option_context(const char *line){
+  if (!line){
+    return false;
+  }
+  if (!has_shell_prefix(line)){
+    return false;
+  }
+  if (has_exposed_shell_chars(line) || has_shell_metachar(line)){
+    return true;
+  }
+  const char *marker = strstr(line, "--");
+  if (!marker){
+    return false;
+  }
+  marker += 2;
+  while (*marker && (isspace((unsigned char)*marker) || *marker == '\'' || *marker == '"' || *marker == '`')){
+    marker++;
+  }
+  if (!*marker){
+    return false;
+  }
+  return !isalnum((unsigned char)*marker);
+}
+
+void refresh_stream_path(int fd, char *cache, size_t cache_len){
   char linkpath[64];
   char target[PATH_MAX];
-  snprintf(linkpath, sizeof(linkpath), "/proc/self/fd/2");
+  snprintf(linkpath, sizeof(linkpath), "/proc/self/fd/%d", fd);
   ssize_t n = readlink(linkpath, target, sizeof(target) - 1);
   if (n > 0){
     target[n] = '\0';
-    if (strcmp(stderr_path_cache, target) != 0){
-      strncpy(stderr_path_cache, target, sizeof(stderr_path_cache) - 1);
-      stderr_path_cache[sizeof(stderr_path_cache) - 1] = '\0';
+    if (strcmp(cache, target) != 0){
+      strncpy(cache, target, cache_len - 1);
+      cache[cache_len - 1] = '\0';
     }
   }
+}
+
+void refresh_stderr_path(void){
+  refresh_stream_path(2, stderr_path_cache, sizeof(stderr_path_cache));
 }
 
 bool is_shell_error_line(const char *line){
   if (!line){
     return false;
   }
-  if (strstr(line, "sh:") || strstr(line, "bash:") || strstr(line, "dash:") || strstr(line, "ash:")){
+  if (has_shell_prefix(line)){
     return true;
   }
-  if (strstr(line, "command not found")){
+  if (strstr(line, "command not found") && (has_shell_prefix(line) || has_exposed_shell_chars(line))){
     return true;
   }
-  if (strstr(line, "syntax error") || strstr(line, "Syntax error")){
+  if ((strstr(line, "syntax error") || strstr(line, "Syntax error")) && has_shell_syntax_context(line)){
     return true;
   }
-  if (strstr(line, "unexpected token") || strstr(line, "Unexpected token")){
+  if ((strstr(line, "unexpected token") || strstr(line, "Unexpected token")) && has_shell_syntax_context(line)){
     return true;
   }
-  if (strstr(line, "not found")){
+  if (strstr(line, "not found") && has_shell_prefix(line)){
     return true;
   }
-  if (strstr(line, "unterminated") || strstr(line, "Unterminated")){
+  if ((strstr(line, "unterminated") || strstr(line, "Unterminated")) && has_shell_syntax_context(line)){
+    return true;
+  }
+  if ((strstr(line, "bad substitution") || strstr(line, "Bad substitution")) && has_shell_syntax_context(line)){
+    return true;
+  }
+  if ((strstr(line, "ambiguous redirect") || strstr(line, "Ambiguous redirect")) && has_shell_syntax_context(line)){
+    return true;
+  }
+  if ((strstr(line, "illegal option") || strstr(line, "Illegal option") ||
+       strstr(line, "invalid option") || strstr(line, "Invalid option") ||
+       strstr(line, "bad number") || strstr(line, "Bad number")) &&
+      has_suspicious_option_context(line)){
     return true;
   }
   return false;
@@ -120,8 +332,7 @@ bool is_fuzz_shell_error(const char *line){
     return false;
   }
   if (strstr(line, " not found") || strstr(line, ": not found")){
-    const char *has_shell_prefix = strstr(line, "sh:") || strstr(line, "bash:") || strstr(line, "dash:") || strstr(line, "ash:");
-    if (has_shell_prefix){
+    if (has_shell_prefix(line)){
       const char *nf = strstr(line, " not found");
       if (!nf){
         nf = strstr(line, ": not found");
@@ -164,53 +375,63 @@ bool is_fuzz_shell_error(const char *line){
             if (tok_len > 0 && tok_len <= 3 && has_nonword){
               return true;
             }
+            if (tok_len > 0 && tok_len <= 64 && token_has_non_ascii(tok_start, tok_len)){
+              return true;
+            }
+            if (tok_len > 0 && tok_len <= 32 && has_nonword && token_has_shell_metachar(tok_start, tok_len)){
+              return true;
+            }
           }
         }
       }
     }
   }
-  if (strstr(line, "Syntax error") || strstr(line, "syntax error")){
+  if ((strstr(line, "Syntax error") || strstr(line, "syntax error")) && has_shell_syntax_context(line)){
     return true;
   }
-  if (strstr(line, "unexpected token") || strstr(line, "Unexpected token")){
+  if ((strstr(line, "unexpected token") || strstr(line, "Unexpected token")) && has_shell_syntax_context(line)){
     return true;
   }
-  if (strstr(line, "EOF") || strstr(line, "eof")){
+  if ((strstr(line, "EOF") || strstr(line, "eof")) && has_shell_syntax_context(line)){
     return true;
   }
-  if (strstr(line, "unterminated") || strstr(line, "Unterminated")){
+  if ((strstr(line, "unterminated") || strstr(line, "Unterminated")) && has_shell_syntax_context(line)){
     return true;
   }
-  if (strstr(line, "command not found")){
+  if (strstr(line, "command not found") && has_shell_prefix(line) && has_exposed_shell_chars(line)){
     return true;
   }
-  if (strstr(line, "bad substitution") || strstr(line, "Bad substitution")){
+  if ((strstr(line, "bad substitution") || strstr(line, "Bad substitution")) && has_shell_syntax_context(line)){
     return true;
   }
-  if (strstr(line, "ambiguous redirect") || strstr(line, "Ambiguous redirect")){
+  if ((strstr(line, "ambiguous redirect") || strstr(line, "Ambiguous redirect")) && has_shell_syntax_context(line)){
     return true;
   }
-  if (strstr(line, "illegal option") || strstr(line, "Illegal option")){
+  if ((strstr(line, "illegal option") || strstr(line, "Illegal option")) && has_suspicious_option_context(line)){
     return true;
   }
-  if (strstr(line, "invalid option") || strstr(line, "Invalid option")){
+  if ((strstr(line, "invalid option") || strstr(line, "Invalid option")) && has_suspicious_option_context(line)){
     return true;
   }
-  if (strstr(line, "bad number") || strstr(line, "Bad number")){
-    return true;
-  }
-  if (strstr(line, "unexpected") || strstr(line, "Unexpected")){
+  if ((strstr(line, "bad number") || strstr(line, "Bad number")) && has_suspicious_option_context(line)){
     return true;
   }
   return false;
 }
 
 void log_shell_errors_from_stderr(void){
-  static long last_pos = 0;
   if (stderr_path_cache[0] == '\0'){
     return;
   }
-  FILE *fp = fopen(stderr_path_cache, "r");
+  inspect_stream_file(stderr_path_cache, true);
+}
+
+void inspect_stream_file(const char *path, bool allow_report){
+  static long last_stderr_pos = 0;
+  if (!path || path[0] == '\0'){
+    return;
+  }
+  FILE *fp = fopen(path, "r");
   if (!fp){
     return;
   }
@@ -223,13 +444,13 @@ void log_shell_errors_from_stderr(void){
     fclose(fp);
     return;
   }
-  if (size < last_pos){
-    last_pos = 0;
+  if (size < last_stderr_pos){
+    last_stderr_pos = 0;
   }
   long max_read = 8192;
   long read_start = size > max_read ? size - max_read : 0;
-  if (read_start < last_pos){
-    read_start = last_pos;
+  if (read_start < last_stderr_pos){
+    read_start = last_stderr_pos;
   }
   if (fseek(fp, read_start, SEEK_SET) != 0){
     fclose(fp);
@@ -237,42 +458,37 @@ void log_shell_errors_from_stderr(void){
   }
   char line[1024];
   while (fgets(line, sizeof(line), fp)){
-    if (is_shell_error_line(line) && !is_benign_shell_error(line) && is_fuzz_shell_error(line)){
-      error_report((unsigned char *)line, strlen(line));
-    }
+    inspect_one_line(line, allow_report);
   }
-  last_pos = ftell(fp);
+  last_stderr_pos = ftell(fp);
   fclose(fp);
+}
+
+void inspect_one_line(const char *line, bool allow_report){
+  if (!line){
+    return;
+  }
+  bool level1 = is_shell_error_line(line);
+  bool benign = is_benign_shell_error(line);
+  bool level3 = is_fuzz_shell_error(line);
+  bool hit = level1 && !benign && level3;
+  if (hit && allow_report){
+    command_error_report((unsigned char *)line, strlen(line));
+  }
 }
 
 __attribute__((constructor))
 void init_fault_escalator(void){
   refresh_stderr_path();
-  log_shell_errors_from_stderr();
+  if (stderr_path_cache[0] != '\0'){
+    inspect_stream_file(stderr_path_cache, false);
+  }
 }
 
 __attribute__((destructor))
 void fini_fault_escalator(void){
   refresh_stderr_path();
   log_shell_errors_from_stderr();
-}
-
-ssize_t write(int fd, const void *buf, size_t count){
-  real_write = dlsym(RTLD_NEXT, "write");
-  if (buf && count > 0 && fd == 2){
-    refresh_stderr_path();
-    log_shell_errors_from_stderr();
-  }
-  return real_write(fd, buf, count);
-}
-
-ssize_t writev(int fd, const struct iovec *iov, int iovcnt){
-  real_writev = dlsym(RTLD_NEXT, "writev");
-  if (iov && iovcnt > 0 && fd == 2){
-    refresh_stderr_path();
-    log_shell_errors_from_stderr();
-  }
-  return real_writev(fd, iov, iovcnt);
 }
 
 void print_repr(FILE *fp, unsigned char *cptr, size_t len){
@@ -285,7 +501,22 @@ void print_repr(FILE *fp, unsigned char *cptr, size_t len){
     }
 }
 
-void send_signal(int strictval){
+int jdbc_error_check(unsigned char *cptr, size_t len){
+    //\x02\x00\x00\x00,\x00\x00\x00\x17unexpected token: SMITH\x00\x00\x00\x0542581\xff\xff\xea3\x7f
+    // \x02\x00\x00\x00(\x00\x00\x00\x13malformed string: '    \x00\x00\x00\x0542584\xff\xff\xea
+    unsigned char *jdbc_msg1 = (unsigned char *)"\x02\x00\x00\x00.\x00\x00\x00.~\x00\x00\x00\x05~\xff\xff\xea"; // 18
+    unsigned char *jdbc_msg4 = (unsigned char *)"\xff\xff\xea"; // 3
+
+    if (pattern_in_bytes(cptr, (int)len, jdbc_msg4, 3)){
+        if (pattern_in_bytes(cptr, (int)len, jdbc_msg1, 18)){
+            error_report(cptr, len);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+void send_signal(int strictval, const char *error_type){
     int pid = 0;
     struct test_process_info *afl_info = NULL;
     printf("FOUND STRICT=%d\n", strictval);
@@ -305,7 +536,7 @@ void send_signal(int strictval){
         fprintf(stderr, "\n");
     }
     if (pid > 0){
-        strcpy(afl_info->error_type,"SQL");
+        strcpy(afl_info->error_type, error_type ? error_type : "SQL");
         fprintf(stderr, "\033[36m [Witcher] sending SEGSEGV to %d %d %d !!!\033[0m\n", afl_info->reqr_process_id, afl_info->process_id, getpid());
         kill(pid, SIGSEGV);
     } else{
@@ -320,6 +551,14 @@ void send_signal(int strictval){
 }
 
 void error_report(unsigned char *cptr, size_t len){
+    error_report_with_type(cptr, len, "SQL", "RECV ERROR FROM DATABASE FOUND!!!!! But not escalating... STRICT=%s \n");
+}
+
+void command_error_report(unsigned char *cptr, size_t len){
+    error_report_with_type(cptr, len, "COMMAND", "RECV ERROR FOUND!!!!! But not escalating... STRICT=%s \n");
+}
+
+void error_report_with_type(unsigned char *cptr, size_t len, const char *error_type, const char *missing_strict_msg){
     char* strict = getenv("STRICT");
     if (! strict){
         char *fname = "/tmp/witcher.env";
@@ -343,7 +582,7 @@ void error_report(unsigned char *cptr, size_t len){
     if (strict){
         FILE *lfp = fopen(fault_log_path, "a");
         if (lfp){
-            fprintf(lfp, "[crash] strict=%s len=%zu\n", strict, len);
+            fprintf(lfp, "[crash] type=%s strict=%s len=%zu\n", error_type ? error_type : "", strict, len);
             print_repr(lfp, cptr, len);
             fprintf(lfp, "\n");
             fclose(lfp);
@@ -376,14 +615,25 @@ void error_report(unsigned char *cptr, size_t len){
         } else {
             fprintf(stderr, "Error encountered, strict=%s\n", strict);
             int strictval = atoi(strict);
-            send_signal(strictval);
+            send_signal(strictval, error_type);
        }
     } else {
-        printf("RECV ERROR FOUND!!!!! But not escalating... STRICT=%s \n", strict);
+        printf(missing_strict_msg, strict);
     }
     fprintf(stderr, "[*] Found error message  \n");
     print_repr(stderr, cptr, len);
     fprintf(stderr, "\n");
+}
+
+void mysql_error_check(unsigned char *cptr, size_t len) {
+
+  //printf("!!!!!!!!!!!!!!!!!!! Thank you for using the special RECV --->> !!!!!!!!!!!!!!!!!!!!\n");
+  unsigned char *mysql_msg = (unsigned char *)"You have an error i";
+  int error_msg_len = strlen((char *)mysql_msg);
+  if (pattern_in_bytes(cptr, (int)len, mysql_msg, error_msg_len)){
+    error_report(cptr, len);
+  }
+
 }
 
 bool buffer_contains_ci(const unsigned char *buf, size_t len, const char *pattern){
@@ -407,17 +657,17 @@ bool buffer_contains_ci(const unsigned char *buf, size_t len, const char *patter
 }
 
 bool shell_error_injection_like(const unsigned char *buf, size_t len){
-  bool has_shell_prefix = buffer_contains_ci(buf, len, "sh:") || buffer_contains_ci(buf, len, "bash:") || buffer_contains_ci(buf, len, "dash:") || buffer_contains_ci(buf, len, "ash:");
+  bool has_prefix = buffer_contains_ci(buf, len, "sh:") || buffer_contains_ci(buf, len, "bash:") || buffer_contains_ci(buf, len, "dash:") || buffer_contains_ci(buf, len, "ash:");
   if (buffer_contains_ci(buf, len, "command not found")){
     return true;
   }
-  if (buffer_contains_ci(buf, len, "syntax error")){
+  if (buffer_contains_ci(buf, len, "syntax error") && (has_prefix || buffer_contains_ci(buf, len, "$(") || buffer_contains_ci(buf, len, "&&") || buffer_contains_ci(buf, len, "||") || buffer_contains_ci(buf, len, ";"))){
     return true;
   }
-  if (buffer_contains_ci(buf, len, "unexpected token")){
+  if (buffer_contains_ci(buf, len, "unexpected token") && (has_prefix || buffer_contains_ci(buf, len, "$(") || buffer_contains_ci(buf, len, "&&") || buffer_contains_ci(buf, len, "||") || buffer_contains_ci(buf, len, ";"))){
     return true;
   }
-  if (buffer_contains_ci(buf, len, "not found") && has_shell_prefix){
+  if (buffer_contains_ci(buf, len, "not found") && has_prefix){
     return true;
   }
   return false;

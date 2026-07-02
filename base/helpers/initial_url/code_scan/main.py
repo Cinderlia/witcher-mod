@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 from typing import Iterable, List, Optional
 
@@ -52,8 +53,6 @@ def main(argv: Optional[List[str]] = None) -> int:
             wf.write(u)
             wf.write("\n")
 
-    print("urls_written={}".format(len(urls)))
-    print("output={}".format(str(output_path)))
     return 0
 
 
@@ -93,13 +92,42 @@ def collect_urls(
 
 
 def iter_source_files(source_dir: Path) -> Iterable[Path]:
-    skip_dirnames = {".git", ".svn", ".hg", "node_modules", "vendor", "__pycache__"}
-    for p in source_dir.rglob("*"):
-        if not p.is_file():
-            continue
-        if any(part in skip_dirnames for part in p.parts):
-            continue
-        yield p
+    skip_dirnames = {
+        ".git",
+        ".hg",
+        ".svn",
+        ".idea",
+        ".vscode",
+        "__pycache__",
+        "node_modules",
+        "vendor",
+        "bower_components",
+        "third_party",
+        "third-party",
+        "thirdparty",
+        "external",
+        "externals",
+        "deps",
+        "dep",
+        "dist",
+        "build",
+        "out",
+        "target",
+        "coverage",
+        "docs",
+        "doc",
+        "tmp",
+        "temp",
+        "cache",
+        "logs",
+        "log",
+        "runtime",
+        "storage",
+    }
+    for dirpath, dirnames, filenames in os.walk(source_dir):
+        dirnames[:] = [d for d in dirnames if d.lower() not in skip_dirnames]
+        for fn in filenames:
+            yield Path(dirpath) / fn
 
 
 def try_read_text(path: Path, max_file_bytes: int) -> Optional[str]:

@@ -129,6 +129,16 @@ export class FoundRequest  {
 
      getPathname(){
         let pathname = this.getURL().pathname;
+        try{
+            if (pathname.indexOf(";") > -1){
+                let parts = pathname.split("/").map(s => {
+                    let idx = s.indexOf(";");
+                    return idx > -1 ? s.slice(0, idx) : s;
+                });
+                pathname = parts.join("/");
+            }
+        } catch(ex){
+        }
         // if (this._url.href.indexOf("/#/") > -1){
         //     let hashIndex = this._url.href.indexOf("#");
         //     pathname = `/${this._url.href.slice(hashIndex)}`
@@ -245,6 +255,49 @@ export class FoundRequest  {
         if (isDefined(postData) && postData.length > 0 ) {
             plist = [...plist, ...postData.split("&")];
         }
+        try{
+            let pathname = this.getPathname() || "";
+            let segs = pathname.split("/");
+            for (let seg of segs){
+                if (!seg){
+                    continue;
+                }
+                if (seg.indexOf(";") > -1){
+                    let parts = seg.split(";");
+                    for (let kv of parts.slice(1)){
+                        if (kv && kv.indexOf("=") > -1){
+                            plist.push(kv);
+                        }
+                    }
+                } else if (seg.toLowerCase().indexOf("%3d") > -1){
+                    try{
+                        let dec = decodeURIComponent(seg);
+                        if (dec.indexOf("=") > -1){
+                            plist.push(dec);
+                        }
+                    } catch(ex){
+                    }
+                }
+            }
+        } catch(ex){
+        }
+        try{
+            let h = this.getURL().hash || "";
+            if (h.startsWith("#")){
+                h = h.slice(1);
+            }
+            if (h.startsWith("!")){
+                h = h.slice(1);
+            }
+            let qidx = h.indexOf("?");
+            if (qidx > -1){
+                h = h.slice(qidx + 1);
+            }
+            if (h && (h.indexOf("=") > -1 || h.indexOf("&") > -1)){
+                plist = [...plist, ...h.split("&")];
+            }
+        } catch(ex){
+        }
         for (let p of plist){
             let {key,value} = this.extractKeyValue(p);
             if (p.length > 0){
@@ -263,4 +316,3 @@ export class FoundRequest  {
 }
 
 //module.exports = FoundRequest;
-

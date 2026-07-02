@@ -6,6 +6,8 @@ class ContextHit(NamedTuple):
     context_type: str
     quote: Optional[str]
     attr_name: Optional[str]
+    tag_name: Optional[str]
+    tag_html: Optional[str]
     position: int
     snippet: str
 
@@ -20,8 +22,18 @@ class ContextLocator:
         hits = []
         for pos in self._find_positions(body, token):
             snippet = self._snippet(body, pos)
-            context_type, quote, attr_name = self._classify(body, pos, token)
-            hits.append(ContextHit(context_type=context_type, quote=quote, attr_name=attr_name, position=pos, snippet=snippet))
+            context_type, quote, attr_name, tag_name, tag_html = self._classify(body, pos, token)
+            hits.append(
+                ContextHit(
+                    context_type=context_type,
+                    quote=quote,
+                    attr_name=attr_name,
+                    tag_name=tag_name,
+                    tag_html=tag_html,
+                    position=pos,
+                    snippet=snippet,
+                )
+            )
         return hits
 
     def _find_positions(self, body: str, token: str) -> List[int]:
@@ -35,17 +47,23 @@ class ContextLocator:
             start = idx + len(token)
         return positions
 
-    def _classify(self, body: str, pos: int, token: str) -> Tuple[str, Optional[str], Optional[str]]:
+    def _classify(
+        self,
+        body: str,
+        pos: int,
+        token: str,
+    ) -> Tuple[str, Optional[str], Optional[str], Optional[str], Optional[str]]:
         if self._in_comment(body, pos):
-            return "comment", None, None
+            return "comment", None, None, None, None
         if self._in_script(body, pos):
             quote = self._script_quote(body, pos)
-            return "script", quote, None
+            return "script", quote, None, "script", self._script_html(body, pos)
         tag = self._tag_at(body, pos)
         if tag:
-            context_type, quote, attr_name = self._tag_context(tag, pos, token)
-            return context_type, quote, attr_name
-        return "text", None, None
+            context_type, quote, attr_name, tag_name = self._tag_context(tag, pos, token)
+            lt, end, _tag_body = tag
+            return context_type, quote, attr_name, tag_name, body[lt : end + 1]
+        return "text", None, None, None, None
 
     def _in_comment(self, body: str, pos: int) -> bool:
         start = body.rfind("<!--", 0, pos)
@@ -66,22 +84,28 @@ class ContextLocator:
             return None
         return lt, end, body[lt + 1:end]
 
-    def _tag_context(self, tag: Tuple[int, int, str], pos: int, token: str) -> Tuple[str, Optional[str], Optional[str]]:
+    def _tag_context(
+        self,
+        tag: Tuple[int, int, str],
+        pos: int,
+        token: str,
+    ) -> Tuple[str, Optional[str], Optional[str], Optional[str]]:
         lt, end, tag_body = tag
         rel = pos - (lt + 1)
-        name_end = re.search(r"[\s/>]", tag_body)
-        if name_end is None:
+        tag_name = self._tag_name(tag_body)
+        tag_name_end = re.search(r"[\s/>]", tag_body)
+        if tag_name_end is None:
             eq_pos = tag_body.find("=")
             if eq_pos != -1:
                 if rel <= eq_pos:
-                    return "attr_name", None, None
-                return "attr_value", None, None
-            return "tag", None, None
-        if rel <= name_end.start():
+                    return "attr_name", None, None, tag_name
+                return "attr_value", None, None, tag_name
+            return "tag", None, None, tag_name
+        if rel <= tag_name_end.start():
             eq_pos = tag_body.find("=")
             if eq_pos != -1 and rel <= eq_pos:
-                return "attr_name", None, None
-            return "tag", None, None
+                return "attr_name", None, None, tag_name
+            return "tag", None, None, tag_name
 
         for match in self.attr_re.finditer(tag_body):
             name = match.group(1)
@@ -89,17 +113,17 @@ class ContextLocator:
             value_start = match.start(2)
             value_end = match.end(2)
             name_start = match.start(1)
-            name_end = match.end(1)
-            if name_start <= rel <= name_end:
-                return "attr_name", None, name.lower()
+            attr_name_end = match.end(1)
+            if name_start <= rel <= attr_name_end:
+                return "attr_name", None, name.lower(), tag_name
             if value_start <= rel <= value_end:
                 quote = None
                 if value and value[0] in {"'", '"'}:
                     quote = value[0]
                 if name.lower() in self.url_attrs:
-                    return "url", quote, name.lower()
-                return "attr_value", quote, name.lower()
-        return "attr_value", None, None
+                    return "url", quote, name.lower(), tag_name
+                return "attr_value", quote, name.lower(), tag_name
+        return "attr_value", None, None, tag_name
 
     def _script_bounds(self, body: str, pos: int) -> Optional[Tuple[int, int]]:
         start = body.rfind("<script", 0, pos)
@@ -114,6 +138,23 @@ class ContextLocator:
         if not (start_end < pos < end):
             return None
         return start_end + 1, end
+
+    def _script_html(self, body: str, pos: int) -> Optional[str]:
+        start = body.rfind("<script", 0, pos)
+        if start == -1:
+            return None
+        start_end = body.find(">", start)
+        if start_end == -1:
+            return None
+        end_start = body.find("</script", start_end)
+        if end_start == -1:
+            return None
+        end_close = body.find(">", end_start)
+        if end_close == -1:
+            return None
+        if not (start_end < pos < end_start):
+            return None
+        return body[start : end_close + 1]
 
     def _script_quote(self, body: str, pos: int) -> Optional[str]:
         bounds = self._script_bounds(body, pos)
@@ -190,3 +231,9 @@ class ContextLocator:
         left = max(0, pos - self.window)
         right = min(len(body), pos + self.window)
         return body[left:right]
+
+    def _tag_name(self, tag_body: str) -> Optional[str]:
+        match = re.match(r"\s*/?\s*([a-zA-Z0-9:_-]+)", tag_body or "")
+        if not match:
+            return None
+        return match.group(1).lower()

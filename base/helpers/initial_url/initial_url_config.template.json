@@ -10,7 +10,9 @@
   "param_minimizer": {
     "urls_filename": "initial_urls_unselected.txt",
     "params_json": "initial_params.json",
-    "mode_arg": "request_crawler"
+    "mode_arg": "request_crawler",
+    "accept_full_params_without_minimization": false,
+    "full_params_output_filename": "initial_urls_full_params.txt"
   },
   "param_scan": {
     "params_json": "initial_params.json",

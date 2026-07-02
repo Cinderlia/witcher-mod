@@ -1,24 +1,64 @@
+import json
 import os
 import shutil
 import stat
 import glob
-from typing import Dict
+import time
+from typing import Dict, Optional
 
 from .integration.seed_injector import generate_xss_seeds
 from .integration.cgi_validator import validate_xss_seeds
 from .integration.attack_runner import run_targeted_attacks
+from .login_refresh import refresh_xss_login
 
 
-def run_xss_flow(work_dir: str, output_dir_name: str = "xss_queue") -> Dict[str, int]:
+def run_xss_flow(
+    work_dir: str,
+    output_dir_name: str = "xss_queue",
+    max_seconds: float = None,
+    result_storage_pathname: str = None,
+    appdir: str = None,
+    config_path: str = None,
+) -> Dict[str, int]:
     debug_mode = False
     log_path = os.path.join(work_dir, "xss_reflection.log")
+    deadline = None
     try:
-        result = generate_xss_seeds(work_dir, output_dir_name=output_dir_name)
-        validation = validate_xss_seeds(work_dir, output_dir_name=output_dir_name)
-        attacks = run_targeted_attacks(work_dir, output_dir_name=output_dir_name)
+        if max_seconds is not None and float(max_seconds) > 0:
+            deadline = time.monotonic() + float(max_seconds)
+    except Exception:
+        deadline = None
+    try:
+        login_refresh = refresh_xss_login(work_dir, config_path=config_path, log_path=log_path)
+        result = generate_xss_seeds(
+            work_dir,
+            output_dir_name=output_dir_name,
+            deadline=deadline,
+            session_cookie_name=login_refresh.get("session_cookie_name", ""),
+            session_cookie_value=login_refresh.get("session_cookie_value", ""),
+        )
+        if deadline is not None and time.monotonic() >= deadline:
+            return dict(result)
+        validation = validate_xss_seeds(work_dir, output_dir_name=output_dir_name, deadline=deadline)
+        if deadline is not None and time.monotonic() >= deadline:
+            summary = dict(result)
+            summary.update(validation)
+            return summary
+        attacks = run_targeted_attacks(work_dir, output_dir_name=output_dir_name, deadline=deadline)
         if not debug_mode:
-            collected = _collect_confirmed(work_dir, output_dir_name)
-            _log(log_path, f"Witcher-XSS collected_confirmed={collected}")
+            if deadline is not None and time.monotonic() >= deadline:
+                summary = dict(result)
+                summary.update(validation)
+                summary.update(attacks)
+                return summary
+            collected = _collect_confirmed(
+                work_dir,
+                output_dir_name,
+                deadline=deadline,
+                result_storage_pathname=result_storage_pathname,
+                appdir=appdir,
+            )
+            _log(log_path, f"Witcher-XSS collected_confirmed_unique={collected}")
         _log(
             log_path,
             f"Witcher-XSS summary scanned={result.get('seeds_scanned', 0)} "
@@ -26,7 +66,8 @@ def run_xss_flow(work_dir: str, output_dir_name: str = "xss_queue") -> Dict[str,
             f"executed={validation.get('executed', 0)} "
             f"reflected={validation.get('reflected', 0)} "
             f"attack_executed={attacks.get('attack_executed', 0)} "
-            f"attack_confirmed={attacks.get('attack_confirmed', 0)}",
+            f"attack_confirmed={attacks.get('attack_confirmed', 0)} "
+            f"attack_confirmed_unique={attacks.get('attack_confirmed_unique', 0)}",
         )
         summary = dict(result)
         summary.update(validation)
@@ -43,7 +84,13 @@ def _log(log_path: str, message: str) -> None:
         wf.write(message + "\n")
 
 
-def _collect_confirmed(work_dir: str, output_dir_name: str) -> int:
+def _collect_confirmed(
+    work_dir: str,
+    output_dir_name: str,
+    deadline: float = None,
+    result_storage_pathname: str = None,
+    appdir: str = None,
+) -> int:
     report_dir = _find_report_dir(work_dir)
     seed_crashes_dir = os.path.join(report_dir, "seed-crashes")
     target_dir = os.path.join(seed_crashes_dir, "xss-confirmed")
@@ -51,29 +98,44 @@ def _collect_confirmed(work_dir: str, output_dir_name: str) -> int:
     _log(os.path.join(work_dir, "xss_reflection.log"), f"Witcher-XSS report_dir={report_dir}")
 
     saved = 0
-    fid = len([n for n in os.listdir(target_dir) if n.startswith("id:")])
+    seen_hashes = set()
     fuzz_script_path = _find_fuzz_script(work_dir)
-    for fuzzer_dir in _fuzzer_dirs(work_dir):
-        queue_root = os.path.join(fuzzer_dir, output_dir_name)
+    encoded_url_path = _encode_result_storage_path(result_storage_pathname, appdir)
+    for queue_root in _queue_roots(work_dir, output_dir_name):
+        if deadline is not None and time.monotonic() >= deadline:
+            break
         if not os.path.isdir(queue_root):
             continue
         for seed_dir in _seed_dirs(queue_root):
+            if deadline is not None and time.monotonic() >= deadline:
+                break
             confirmed_dir = os.path.join(seed_dir, "confirmed")
             if not os.path.isdir(confirmed_dir):
                 continue
+            source_seed = _load_source_seed(seed_dir)
             for name in os.listdir(confirmed_dir):
+                if deadline is not None and time.monotonic() >= deadline:
+                    break
                 if name.endswith(".html") or name.endswith(".json") or name.endswith(".tmp"):
                     continue
                 src = os.path.join(confirmed_dir, name)
                 if os.path.isfile(src):
-                    fid += 1
-                    crash_name = f"id:{fid:06},src:{name},xss"
+                    with open(src, "rb") as rf:
+                        seed_hash = rf.read()
+                    if seed_hash in seen_hashes:
+                        continue
+                    seen_hashes.add(seed_hash)
+                    fid = len([n for n in os.listdir(target_dir) if n.startswith("id:") and not n.endswith(".sh")])
+                    src_name = source_seed or name
+                    if encoded_url_path:
+                        crash_name = f"id:{fid:06},{encoded_url_path},src:{src_name},xss"
+                    else:
+                        crash_name = f"id:{fid:06},src:{src_name},xss"
                     dst = os.path.join(target_dir, crash_name)
                     shutil.copy2(src, dst)
                     if fuzz_script_path:
                         _write_repro_script(fuzz_script_path, dst)
                     saved += 1
-        shutil.rmtree(queue_root)
     return saved
 
 
@@ -112,6 +174,18 @@ def _fuzzer_dirs(work_dir: str):
     return items
 
 
+def _queue_roots(work_dir: str, output_dir_name: str):
+    modern_root = os.path.join(work_dir, output_dir_name)
+    if os.path.isdir(modern_root):
+        return [modern_root]
+    items = []
+    for fuzzer_dir in _fuzzer_dirs(work_dir):
+        queue_root = os.path.join(fuzzer_dir, output_dir_name)
+        if os.path.isdir(queue_root):
+            items.append(queue_root)
+    return items
+
+
 def _find_report_dir(work_dir: str):
     candidates = []
     for base in ["/results", os.path.dirname(work_dir)]:
@@ -123,6 +197,37 @@ def _find_report_dir(work_dir: str):
         candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
         return candidates[0]
     return work_dir
+
+
+def _load_source_seed(seed_dir: str) -> Optional[str]:
+    map_path = os.path.join(seed_dir, "xss_map.json")
+    if not os.path.isfile(map_path):
+        return None
+    try:
+        with open(map_path, "r", encoding="utf-8") as rf:
+            data = json.load(rf)
+    except Exception:
+        return None
+    if not isinstance(data, list):
+        return None
+    for item in data:
+        if isinstance(item, dict):
+            source_seed = item.get("source_seed")
+            if source_seed:
+                return str(source_seed)
+    return None
+
+
+def _encode_result_storage_path(result_storage_pathname: str, appdir: str) -> Optional[str]:
+    if not result_storage_pathname:
+        return None
+    encoded = str(result_storage_pathname)
+    if appdir:
+        encoded = encoded.replace(appdir + "/", "")
+        encoded = encoded.replace(appdir + "\\", "")
+    encoded = encoded.replace("\\", "/").lstrip("/")
+    encoded = encoded.replace("/", "+")
+    return encoded or None
 
 
 def _write_repro_script(fuzz_script_path: str, seed_path: str) -> None:

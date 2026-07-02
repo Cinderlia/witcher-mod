@@ -87,12 +87,12 @@ class Reporter(Thread):
         self.summary_stats = summary_stats
 
     def get_fuzzer_stats(self):
-        self.stats = {}
+        local_stats = {}
         if os.path.isdir(self.work_dir):
             for fuzzer_dir in os.listdir(self.work_dir):
                 if os.path.isdir(os.path.join(self.work_dir, fuzzer_dir)):
                     stat_path = os.path.join(self.work_dir, fuzzer_dir, "fuzzer_stats")
-                    self.stats[fuzzer_dir] = {}
+                    fuzzer_stats = {}
                     if os.path.isfile(stat_path) and os.access(stat_path, os.R_OK):
                         with open(stat_path, "r") as f:
                             stat_blob = f.read()
@@ -109,18 +109,20 @@ class Reporter(Thread):
                                     print(f"Skipping stat '${stat}' in \n${stat_lines} because no split value")
                                     continue
                                 try:
-                                    self.stats[fuzzer_dir][key.strip()] = val.strip()
+                                    fuzzer_stats[key.strip()] = val.strip()
                                 except KeyError as ke:
                                     print(ke)
                                     traceback.format_exc()
-                                    print(self.stats.keys())
-                    if not self.stats[fuzzer_dir]:
-                        del self.stats[fuzzer_dir]
-                        continue
+                                    print(local_stats.keys())
+                    if fuzzer_stats:
+                        local_stats[fuzzer_dir] = fuzzer_stats
+        self.stats = local_stats
 
     def print_details(self, mandatory_print=False, fuzzer=None):
         timeout_str = ""
         run_until_str = ""
+        if fuzzer is None:
+            fuzzer = self.fuzzer
         if fuzzer and hasattr(fuzzer, "timeout"):
             self.timeout = fuzzer.timeout
         self.elapsed_time = time.time() - self.start_time
@@ -155,6 +157,8 @@ class Reporter(Thread):
         self.last_printed_paths_total = self.summary_stats["paths_total"]
 
     def generate_report_line(self, mandatory_record=False, fuzzer=None):
+        if fuzzer is None:
+            fuzzer = self.fuzzer
         if not os.access(os.path.join(self.work_dir,"fuzzer-master","fuzzer_stats"), os.R_OK):
             if self.chown_files is None:
                 pass

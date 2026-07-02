@@ -247,7 +247,15 @@ async function explorationWorker(workernum, appData){
         }
 
         let re = new RequestExplorer(appData, workernum, BASE_APPDIR, nextRequest);
-        await re.start();
+        try{
+            await re.start();
+        } catch(ex){
+            console.log("[WC] request explorer failed, skip current request and continue");
+            try{
+                console.log(ex && ex.stack ? ex.stack : ex);
+            } catch(inner){
+            }
+        }
 
         console.log("\x1b[38;5;12m^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ Completed " + appData.currentRequest.url() + " ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ \x1b[0m\n");
         appData.updateReqsFromExternal()

@@ -7,7 +7,7 @@ from .common import WITCHER_MARKER, html_unescape
 def build_payloads(quote: Optional[str] = None) -> List[str]:
     return [
         f"javascript:alert({WITCHER_MARKER})",
-        f"javascript:var a='{WITCHER_MARKER}'",
+        f"javascript:confirm({WITCHER_MARKER})",
         f"data:text/html,<script>{WITCHER_MARKER}</script>",
         f"vbscript:msgbox({WITCHER_MARKER})",
     ]

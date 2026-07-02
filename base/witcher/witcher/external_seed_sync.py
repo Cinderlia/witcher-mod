@@ -3,7 +3,7 @@ import os
 import re
 import threading
 import time
-from typing import Dict, Optional, Set
+from typing import Dict, Optional, Set, Tuple
 
 
 class ExternalSeedSync:
@@ -31,11 +31,90 @@ class ExternalSeedSync:
         self.logger = logger
 
         self.sync_queue_dir = os.path.join(self.work_dir, self.sync_name, "queue")
+        env_root = os.path.join(self.work_dir, "seed_env_profiles")
+        self.parent_env_dir = os.path.abspath(os.environ.get("WC_ENV_PARENT_DIR") or os.path.join(env_root, "parent"))
+        self.child_env_dir = os.path.abspath(os.environ.get("WC_ENV_CHILD_DIR") or os.path.join(env_root, "child"))
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._seen_hashes: Set[str] = set()
         self._seen_paths: Dict[str, float] = {}
         self._next_id = self._init_next_id()
+
+    @staticmethod
+    def _extract_env_id(name: str) -> str:
+        match = re.search(r"(?:^|,)env:([^,]+)", name or "")
+        if not match:
+            return ""
+        return str(match.group(1) or "").strip()
+
+    @staticmethod
+    def _load_env_profile(path: str) -> Dict[str, Optional[str]]:
+        out: Dict[str, Optional[str]] = {}
+        if not path or not os.path.isfile(path):
+            return out
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as rf:
+                for raw_line in rf:
+                    line = str(raw_line or "").rstrip("\r\n")
+                    if not line:
+                        continue
+                    if "=" in line:
+                        key, val = line.split("=", 1)
+                        parsed_val: Optional[str] = str(val or "")
+                    else:
+                        key = line
+                        parsed_val = None
+                    key = str(key or "").strip()
+                    if not key:
+                        continue
+                    out[key] = parsed_val
+        except Exception:
+            return {}
+        return out
+
+    @staticmethod
+    def _env_signature(env_map: Dict[str, Optional[str]]) -> Tuple[Tuple[str, str], ...]:
+        if not isinstance(env_map, dict) or not env_map:
+            return tuple()
+        items = []
+        for key in sorted(env_map.keys()):
+            key_s = str(key or "").strip()
+            if not key_s:
+                continue
+            value = env_map.get(key_s)
+            items.append((key_s, "__WC_NONE__" if value is None else str(value)))
+        return tuple(items)
+
+    def _resolve_child_env_id(self, env_id: str) -> str:
+        env_id = str(env_id or "").strip()
+        if not env_id:
+            return ""
+        parent_path = os.path.join(self.parent_env_dir, f"{env_id}.env")
+        parent_env = self._load_env_profile(parent_path)
+        if not parent_env:
+            return env_id
+        wanted_sig = self._env_signature(parent_env)
+        if not wanted_sig:
+            return env_id
+        try:
+            os.makedirs(self.child_env_dir, exist_ok=True)
+        except Exception:
+            return env_id
+        try:
+            child_names = sorted(os.listdir(self.child_env_dir))
+        except Exception:
+            return env_id
+        for name in child_names:
+            if not str(name).endswith(".env"):
+                continue
+            child_id = str(name[:-4] or "").strip()
+            if not child_id:
+                continue
+            child_path = os.path.join(self.child_env_dir, name)
+            child_sig = self._env_signature(self._load_env_profile(child_path))
+            if child_sig and child_sig == wanted_sig:
+                return child_id
+        return env_id
 
     def _init_next_id(self) -> int:
         os.makedirs(self.sync_queue_dir, exist_ok=True)
@@ -104,17 +183,24 @@ class ExternalSeedSync:
             if not data or len(data) > self.max_seed_size:
                 continue
 
-            digest = hashlib.sha1(data).hexdigest()
+            env_id = self._extract_env_id(entry)
+            resolved_env_id = self._resolve_child_env_id(env_id) if env_id else ""
+            digest = hashlib.sha1(data + resolved_env_id.encode("utf-8", errors="ignore")).hexdigest()
             if digest in self._seen_hashes:
                 continue
 
             self._seen_hashes.add(digest)
             out_name = f"id:{self._next_id:06d},src:extseed"
+            if resolved_env_id:
+                out_name += f",env:{resolved_env_id}"
             self._next_id += 1
             out_path = os.path.join(self.sync_queue_dir, out_name)
             with open(out_path, "wb") as wf:
                 wf.write(data)
-            self.logger(f"[WC] Imported external seed -> {out_path}")
+            if env_id and resolved_env_id and env_id != resolved_env_id:
+                self.logger(f"[WC] Imported external seed -> {out_path} (env dedup {env_id} -> {resolved_env_id})")
+            else:
+                self.logger(f"[WC] Imported external seed -> {out_path}")
 
 
 def start_external_seed_sync(work_dir: str, config: dict, logger=print) -> Optional[ExternalSeedSync]:

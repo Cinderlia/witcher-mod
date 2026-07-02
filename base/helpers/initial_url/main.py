@@ -70,7 +70,6 @@ def main(argv: Optional[List[str]] = None) -> int:
     run_param_pipeline = cfg_param_scan and (init_meta.get("param_scan") is not True)
 
     if (not run_code_scan) and (not run_param_pipeline):
-        print("zero_scan=1")
         crawler_cfg = cfg.get("crawler", {})
         start_crawler = args.start_crawler or (isinstance(crawler_cfg, dict) and crawler_cfg.get("start", False))
         if start_crawler:
@@ -89,13 +88,22 @@ def main(argv: Optional[List[str]] = None) -> int:
             _start_request_crawler(base_url, str(base_appdir), crawler_cfg)
         return 0
 
-    print("zero_scan=0")
     tree = build_php_tree(str(source_dir))
-    php_list_fn = cfg.get("php_list_filename", "php_files.txt")
-    write_lines(base_appdir / php_list_fn, sorted(dedupe_list(leaf_relpaths(tree))))
+    # Removed redundant archive output: php_files.txt was not consumed by downstream pipeline.
 
     urls = []
     valid_entry_files = None
+    raw_code_urls = []
+
+    if run_code_scan:
+        cs_raw_out_fn = "initial_urls_code_scan_raw.txt"
+        raw_code_urls = collect_code_scan_urls(
+            base_url=base_url,
+            source_dir=source_dir,
+            max_file_bytes=args.max_file_bytes,
+            tree=None,
+        )
+        write_lines(base_appdir / cs_raw_out_fn, raw_code_urls)
 
     if run_param_pipeline:
         ps_cfg = cfg.get("param_scan", {})
@@ -147,39 +155,30 @@ def main(argv: Optional[List[str]] = None) -> int:
                                 if u:
                                     base_u = u.split("?")[0].split("#")[0]
                                     valid_entry_files.add(base_u)
-                except Exception as ex:
-                    print("Failed to read valid entry files: {}".format(ex))
+                except Exception:
+                    pass
 
     if run_code_scan:
         cs_out_fn = cfg.get("code_scan", {}).get("output_filename", args.output)
-        code_urls = collect_code_scan_urls(
-            base_url=base_url,
-            source_dir=source_dir,
-            max_file_bytes=args.max_file_bytes,
-            tree=tree,
-        )
-        
+        code_urls = list(raw_code_urls)
+
         if valid_entry_files is not None:
             filtered_code_urls = []
             for cu in code_urls:
                 cu_base = cu.split("?")[0].split("#")[0]
                 if cu_base in valid_entry_files:
                     filtered_code_urls.append(cu)
-            print(f"Filtered code_urls from {len(code_urls)} to {len(filtered_code_urls)} using valid_entry_files")
             code_urls = filtered_code_urls
 
         write_lines(base_appdir / cs_out_fn, code_urls)
         urls.extend(code_urls)
         seed_afl_request_data_json(str(base_appdir), code_urls)
         update_request_data_meta(str(base_appdir), {"code_scan": True})
-        selected_relpaths = get_selected_relpaths(tree)
-        write_lines(base_appdir / "selected_php_files.txt", selected_relpaths)
+        # Removed redundant archive output: selected_php_files.txt was not consumed downstream.
 
     integrated_out_fn = cfg.get("integrated_urls_filename", args.output)
     integrated_path = output_path if integrated_out_fn == args.output else (base_appdir / integrated_out_fn)
     write_lines(integrated_path, urls)
-    print("urls_written={}".format(len(urls)))
-    print("output={}".format(str(integrated_path)))
 
     crawler_cfg = cfg.get("crawler", {})
     start_crawler = args.start_crawler or (isinstance(crawler_cfg, dict) and crawler_cfg.get("start", False))
@@ -243,7 +242,9 @@ def default_config() -> dict:
         "param_minimizer": {
             "urls_filename": "initial_urls_unselected.txt",
             "params_json": "initial_params.json",
-            "mode_arg": "request_crawler"
+            "mode_arg": "request_crawler",
+            "accept_full_params_without_minimization": False,
+            "full_params_output_filename": "initial_urls_full_params.txt"
         },
         "crawler": {
             "start": False,
@@ -313,10 +314,9 @@ def _start_request_crawler(base_url: str, base_appdir: str, crawler_cfg: dict) -
         if no_headless:
             cmd.append("--no-headless")
 
-        print("starting_crawler={}".format(" ".join(cmd)))
         _run_foreground(cmd)
-    except Exception as ex:
-        print("start crawler failed: {}".format(ex))
+    except Exception:
+        pass
 
 
 def build_unselected_urls(tree, base_url: str) -> List[str]:
@@ -440,7 +440,6 @@ def seed_afl_request_data_json(base_appdir: str, urls: List[str]) -> None:
 
     with open(fn, "w", encoding="utf-8") as wf:
         json.dump(data, wf, ensure_ascii=False, indent=2)
-    print("seed_afl_request_data_json added={} file={}".format(added, str(fn)))
 
 
 def update_request_data_meta(base_appdir: str, init_updates: dict) -> None:
@@ -472,7 +471,6 @@ def update_request_data_meta(base_appdir: str, init_updates: dict) -> None:
     try:
         with open(fn, "w", encoding="utf-8") as wf:
             json.dump(data, wf, ensure_ascii=False, indent=2)
-        print("request_data_meta_updated file={} keys={}".format(str(fn), ",".join(sorted(init_updates.keys()))))
     except Exception:
         pass
 
@@ -486,6 +484,8 @@ def _run_param_minimizer(base_url: str, base_appdir: str, cfg: dict, crawler_cfg
     urls_fn = "initial_urls_unselected.txt"
     params_fn = "initial_params.json"
     mode_arg = "request_crawler"
+    accept_full_params_without_minimization = False
+    full_params_output_filename = "initial_urls_full_params.txt"
     if isinstance(pm_cfg, dict):
         if pm_cfg.get("urls_filename"):
             urls_fn = pm_cfg.get("urls_filename")
@@ -493,11 +493,14 @@ def _run_param_minimizer(base_url: str, base_appdir: str, cfg: dict, crawler_cfg
             params_fn = pm_cfg.get("params_json")
         if pm_cfg.get("mode_arg"):
             mode_arg = pm_cfg.get("mode_arg")
+        accept_full_params_without_minimization = bool(pm_cfg.get("accept_full_params_without_minimization", False))
+        if pm_cfg.get("full_params_output_filename"):
+            full_params_output_filename = str(pm_cfg.get("full_params_output_filename") or "").strip() or "initial_urls_full_params.txt"
 
     urls_path = str(Path(base_appdir) / urls_fn)
     params_path = str(Path(base_appdir) / params_fn)
+    full_params_output_path = str(Path(base_appdir) / full_params_output_filename)
     if not Path(urls_path).exists() or not Path(params_path).exists():
-        print("param_minimizer skipped missing files urls={} params={}".format(urls_path, params_path))
         return 2
 
     node_bin = "node"
@@ -529,9 +532,12 @@ def _run_param_minimizer(base_url: str, base_appdir: str, cfg: dict, crawler_cfg
     if mode_arg:
         cmd.append(mode_arg)
     cmd.extend([base_url, base_appdir, urls_path, params_path])
+    if accept_full_params_without_minimization:
+        cmd.append("--accept-full-params-without-minimization")
+    if full_params_output_path:
+        cmd.extend(["--full-params-output", full_params_output_path])
     if no_headless:
         cmd.append("--no-headless")
-    print("starting_param_minimizer={}".format(" ".join(cmd)))
     return _run_foreground(cmd)
 
 

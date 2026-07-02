@@ -38,12 +38,10 @@ class XSSConfig:
         self.random_templates = random_templates or [
             "<xss>{token}</xss>",
             "\"{token}\"",
-            "'{token}'",
             "{token}",
         ]
         self.attack_templates = attack_templates or [
             "<script>{token}</script>",
             "\"><img src=x onerror={token}>",
-            "'><svg/onload={token}>",
             "javascript:{token}",
         ]

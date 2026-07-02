@@ -26,6 +26,8 @@
 #define TRUE 1
 #define FALSE 0
 #define HTTP_VAR_TYPES 3
+#define EXTSYNC_DIRNAME "extsync"
+#define EXTSYNC_INTERVAL_MS 10000
 #define _GNU_SOURCE
 #define _FILE_OFFSET_BITS 64
 
@@ -49,7 +51,6 @@
 #include <dlfcn.h>
 #include <sched.h>
 #include <regex.h>
-
 #include <sys/wait.h>
 #include <sys/time.h>
 #include <sys/shm.h>
@@ -132,8 +133,8 @@ EXP_ST u8  skip_deterministic,        /* Skip deterministic stages?       */
 static s32 out_fd,                    /* Persistent fd for out_file       */
            dev_urandom_fd = -1,       /* Persistent fd for /dev/urandom   */
            dev_null_fd = -1,          /* Persistent fd for /dev/null      */
-           fsrv_ctl_fd,               /* Fork server control pipe (write) */
-           fsrv_st_fd;                /* Fork server status pipe (read)   */
+           fsrv_ctl_fd = -1,          /* Fork server control pipe (write) */
+           fsrv_st_fd = -1;           /* Fork server status pipe (read)   */
 
 static s32 forksrv_pid,               /* PID of the fork server           */
            child_pid = -1,            /* PID of the fuzzed program        */
@@ -205,9 +206,37 @@ static s32 splicing_with = -1;        /* Splicing with which test case?   */
 static u32 master_id, master_max;     /* Master instance job splitting    */
 
 static u32 syncing_case;              /* Syncing with case #...           */
+static u64 last_extsync_time;         /* Last extsync poll time (ms)      */
+static u8  extsync_ready,             /* Enable extsync polling?          */
+           extsync_in_progress;       /* Avoid recursive extsync polling  */
 
 static s32 stage_cur_byte,            /* Byte offset of current stage op  */
            stage_cur_val;             /* Value used for stage op          */
+
+struct seed_env_default {
+
+  u8* key;
+  u8* value;
+  u8  present;
+
+};
+
+static struct seed_env_default* seed_env_defaults;
+static u32 seed_env_defaults_cnt;
+static u8* seed_env_parent_dir;
+static u8* seed_env_child_dir;
+static u8* current_seed_env_id;
+static u8  current_seed_env_from_parent;
+
+struct queue_entry;
+
+struct env_schedule_slot {
+  struct queue_entry* q;
+  u32 index;
+};
+
+static struct env_schedule_slot* env_schedule_slots;
+static u32 env_schedule_count, env_schedule_pos;
 
 static u8  stage_val_type;            /* Value type (STAGE_VAL_*)         */
 
@@ -235,6 +264,7 @@ static FILE* plot_file;               /* Gnuplot output file              */
 struct queue_entry {
 
   u8* fname;                          /* File name for the test case      */
+  u8* env_id;                         /* Optional env profile tag         */
   u32 len;                            /* Input length                     */
 
   u8  cal_failed,                     /* Calibration failed?              */
@@ -266,6 +296,111 @@ static struct queue_entry *queue,     /* Fuzzing queue (linked list)      */
                           *queue_top, /* Top of the list                  */
                           *q_prev100; /* Previous 100 marker              */
 static struct queue_entry *stopped_running_queue_at = NULL;
+
+static s32 env_schedule_slot_compare(const void* a, const void* b) {
+
+  const struct env_schedule_slot* sa = (const struct env_schedule_slot*)a;
+  const struct env_schedule_slot* sb = (const struct env_schedule_slot*)b;
+  const u8* env_a = (sa && sa->q && sa->q->env_id) ? sa->q->env_id : (const u8*)"";
+  const u8* env_b = (sb && sb->q && sb->q->env_id) ? sb->q->env_id : (const u8*)"";
+  s32 cmp = strcmp((const char*)env_a, (const char*)env_b);
+
+  if (cmp) return cmp;
+  if (sa->index < sb->index) return -1;
+  if (sa->index > sb->index) return 1;
+  return 0;
+
+}
+
+
+static void rebuild_env_schedule(void) {
+
+  struct queue_entry* q = queue;
+  u32 idx = 0;
+
+  if (env_schedule_slots) {
+    ck_free(env_schedule_slots);
+    env_schedule_slots = NULL;
+  }
+
+  env_schedule_count = 0;
+  env_schedule_pos   = 0;
+
+  if (!queue || !queued_paths) {
+    queue_cur = NULL;
+    return;
+  }
+
+  env_schedule_slots = ck_alloc(sizeof(struct env_schedule_slot) * queued_paths);
+
+  while (q && idx < queued_paths) {
+    env_schedule_slots[idx].q = q;
+    env_schedule_slots[idx].index = idx;
+    idx++;
+    q = q->next;
+  }
+
+  env_schedule_count = idx;
+
+  if (!env_schedule_count) {
+    ck_free(env_schedule_slots);
+    env_schedule_slots = NULL;
+    queue_cur = NULL;
+    return;
+  }
+
+  qsort(env_schedule_slots, env_schedule_count,
+        sizeof(struct env_schedule_slot), env_schedule_slot_compare);
+
+  queue_cur = env_schedule_slots[0].q;
+  current_entry = env_schedule_slots[0].index;
+
+}
+
+
+static void seek_env_schedule_to_index(u32 wanted_index) {
+
+  u32 i;
+
+  if (!env_schedule_slots || !env_schedule_count) {
+    queue_cur = NULL;
+    return;
+  }
+
+  for (i = 0; i < env_schedule_count; i++) {
+    if (env_schedule_slots[i].index == wanted_index) {
+      env_schedule_pos = i;
+      queue_cur = env_schedule_slots[i].q;
+      current_entry = env_schedule_slots[i].index;
+      return;
+    }
+  }
+
+  env_schedule_pos = 0;
+  queue_cur = env_schedule_slots[0].q;
+  current_entry = env_schedule_slots[0].index;
+
+}
+
+
+static void advance_env_schedule(void) {
+
+  if (!env_schedule_slots || !env_schedule_count) {
+    queue_cur = NULL;
+    return;
+  }
+
+  env_schedule_pos++;
+
+  if (env_schedule_pos >= env_schedule_count) {
+    queue_cur = NULL;
+    return;
+  }
+
+  queue_cur = env_schedule_slots[env_schedule_pos].q;
+  current_entry = env_schedule_slots[env_schedule_pos].index;
+
+}
 
 static struct queue_entry*
   top_rated[MAP_SIZE];                /* Top entries for bitmap bytes     */
@@ -841,11 +976,355 @@ static void mark_as_redundant(struct queue_entry* q, u8 state) {
 
 /* Append new test case to the queue. */
 
+static u8* extract_env_tag_from_name(const u8* fname) {
+
+  const u8* base = fname;
+  const u8* tag;
+  const u8* end;
+  u32 len;
+  u8* ret;
+
+  if (!fname) return NULL;
+
+  if (strrchr((const char*)fname, '/'))
+    base = (const u8*)strrchr((const char*)fname, '/') + 1;
+
+  tag = (const u8*)strstr((const char*)base, ",env:");
+  if (tag) tag += 5;
+  else if (!strncmp((const char*)base, "env:", 4)) tag = base + 4;
+  else return NULL;
+
+  end = tag;
+  while (*end && *end != ',' && *end != '\n' && *end != '\r') end++;
+  len = end - tag;
+  if (!len) return NULL;
+
+  ret = ck_alloc(len + 1);
+  memcpy(ret, tag, len);
+  ret[len] = 0;
+  return ret;
+
+}
+
+static void append_env_change_summary(char* buf, size_t buf_sz, const char* key,
+                                      const char* value, u8 is_unset) {
+
+  size_t cur_len;
+  int written;
+
+  if (!buf || !buf_sz || !key || !*key) return;
+  cur_len = strlen(buf);
+  if (cur_len >= buf_sz - 1) return;
+
+  written = snprintf(buf + cur_len, buf_sz - cur_len, "%s%s%s%s",
+                     cur_len ? "," : "",
+                     key,
+                     is_unset ? ":<unset>" : "=",
+                     is_unset ? "" : (value ? value : ""));
+  if (written < 0) return;
+  if ((size_t)written >= buf_sz - cur_len)
+    buf[buf_sz - 1] = 0;
+
+}
+
+static void stop_forkserver(void) {
+
+  if (child_pid > 0) {
+    kill(child_pid, SIGKILL);
+    waitpid(child_pid, NULL, 0);
+    child_pid = -1;
+  }
+
+  if (forksrv_pid > 0) {
+    kill(forksrv_pid, SIGKILL);
+    waitpid(forksrv_pid, NULL, 0);
+    forksrv_pid = 0;
+  }
+
+  if (fsrv_ctl_fd >= 0) {
+    close(fsrv_ctl_fd);
+    fsrv_ctl_fd = -1;
+  }
+
+  if (fsrv_st_fd >= 0) {
+    close(fsrv_st_fd);
+    fsrv_st_fd = -1;
+  }
+
+}
+
+static void capture_seed_env_defaults(void) {
+
+  u8* raw = (u8*)getenv("WC_SEED_ENV_KEYS");
+  u8* dup;
+  u8* cursor;
+
+  if (!raw || !*raw || seed_env_defaults_cnt) return;
+
+  dup = ck_strdup(raw);
+  cursor = dup;
+
+  while (cursor && *cursor) {
+
+    u8* next = (u8*)strchr((char*)cursor, ',');
+    u8* key;
+    u8* end;
+    u8* val;
+
+    if (next) *next = 0;
+
+    while (*cursor == ' ' || *cursor == '\t') cursor++;
+    key = cursor;
+    end = key + strlen((char*)key);
+    while (end > key && (end[-1] == ' ' || end[-1] == '\t')) *(--end) = 0;
+
+    if (*key) {
+
+      seed_env_defaults = ck_realloc(seed_env_defaults,
+          (seed_env_defaults_cnt + 1) * sizeof(struct seed_env_default));
+      seed_env_defaults[seed_env_defaults_cnt].key = ck_strdup(key);
+      val = (u8*)getenv((char*)key);
+      if (val) {
+        seed_env_defaults[seed_env_defaults_cnt].value = ck_strdup(val);
+        seed_env_defaults[seed_env_defaults_cnt].present = 1;
+      } else {
+        seed_env_defaults[seed_env_defaults_cnt].value = NULL;
+        seed_env_defaults[seed_env_defaults_cnt].present = 0;
+      }
+      seed_env_defaults_cnt++;
+
+    }
+
+    if (!next) break;
+    cursor = next + 1;
+
+  }
+
+  ck_free(dup);
+
+}
+
+static void restore_default_seed_env(void) {
+
+  u32 i;
+  for (i = 0; i < seed_env_defaults_cnt; i++) {
+    if (seed_env_defaults[i].present)
+      setenv((char*)seed_env_defaults[i].key,
+             (char*)seed_env_defaults[i].value, 1);
+    else
+      unsetenv((char*)seed_env_defaults[i].key);
+  }
+
+}
+
+static u8 apply_seed_env_file(u8* dir_path, u8* env_id, u32* set_cnt,
+                              u32* unset_cnt, u32* verify_fail_cnt,
+                              char* summary, size_t summary_sz,
+                              char* used_path, size_t used_path_sz,
+                              char* fail_reason, size_t fail_reason_sz) {
+
+  FILE* fp;
+  u8* path;
+  char line[8192];
+
+  if (set_cnt) *set_cnt = 0;
+  if (unset_cnt) *unset_cnt = 0;
+  if (verify_fail_cnt) *verify_fail_cnt = 0;
+  if (summary && summary_sz) summary[0] = 0;
+  if (used_path && used_path_sz) used_path[0] = 0;
+  if (fail_reason && fail_reason_sz) fail_reason[0] = 0;
+
+  if (!dir_path || !env_id || !*env_id) {
+    if (fail_reason && fail_reason_sz)
+      snprintf(fail_reason, fail_reason_sz, "invalid_env_request");
+    return 0;
+  }
+
+  path = alloc_printf("%s/%s.env", dir_path, env_id);
+  if (used_path && used_path_sz)
+    snprintf(used_path, used_path_sz, "%s", (char*)path);
+  fp = fopen((char*)path, "r");
+  if (!fp) {
+    if (fail_reason && fail_reason_sz)
+      snprintf(fail_reason, fail_reason_sz, "open_failed:%s", strerror(errno));
+    ck_free(path);
+    return 0;
+  }
+
+  while (fgets(line, sizeof(line), fp)) {
+
+    char* eq;
+    char* cur = line;
+    size_t line_len = strlen(line);
+
+    while (line_len && (line[line_len - 1] == '\n' || line[line_len - 1] == '\r'))
+      line[--line_len] = 0;
+
+    while (*cur == ' ' || *cur == '\t') cur++;
+    if (!*cur || *cur == '#') continue;
+
+    eq = strchr(cur, '=');
+    if (eq) {
+      char* key;
+      char* val;
+      char* got;
+      *eq = 0;
+      key = cur;
+      val = eq + 1;
+      if (setenv(key, val, 1)) {
+        if (fail_reason && fail_reason_sz)
+          snprintf(fail_reason, fail_reason_sz, "setenv_failed:%s:%s",
+                   key, strerror(errno));
+      } else {
+        if (set_cnt) (*set_cnt)++;
+      }
+      append_env_change_summary(summary, summary_sz, key, val, 0);
+      got = getenv(key);
+      if (!got || strcmp(got, val)) {
+        if (verify_fail_cnt) (*verify_fail_cnt)++;
+      }
+    } else {
+      if (unsetenv(cur)) {
+        if (fail_reason && fail_reason_sz)
+          snprintf(fail_reason, fail_reason_sz, "unsetenv_failed:%s:%s",
+                   cur, strerror(errno));
+      } else {
+        if (unset_cnt) (*unset_cnt)++;
+      }
+      append_env_change_summary(summary, summary_sz, cur, NULL, 1);
+      if (getenv(cur)) {
+        if (verify_fail_cnt) (*verify_fail_cnt)++;
+      }
+    }
+
+  }
+
+  fclose(fp);
+  ck_free(path);
+  return 1;
+
+}
+
+static void maybe_promote_parent_env_to_child(void) {
+
+  u8* src_path;
+  u8* dst_path;
+  s32 src_fd = -1, dst_fd = -1;
+  ssize_t rlen;
+  u8 buf[4096];
+
+  if (!current_seed_env_from_parent || !current_seed_env_id ||
+      !seed_env_parent_dir || !seed_env_child_dir) return;
+
+  if (mkdir((char*)seed_env_child_dir, 0700) && errno != EEXIST) return;
+
+  src_path = alloc_printf("%s/%s.env", seed_env_parent_dir, current_seed_env_id);
+  dst_path = alloc_printf("%s/%s.env", seed_env_child_dir, current_seed_env_id);
+
+  src_fd = open((char*)src_path, O_RDONLY);
+  if (src_fd < 0) goto cleanup;
+
+  dst_fd = open((char*)dst_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+  if (dst_fd < 0) goto cleanup;
+
+  while ((rlen = read(src_fd, buf, sizeof(buf))) > 0)
+    ck_write(dst_fd, buf, rlen, dst_path);
+
+  close(dst_fd);
+  dst_fd = -1;
+
+cleanup:
+  if (src_fd >= 0) close(src_fd);
+  if (dst_fd >= 0) close(dst_fd);
+  ck_free(src_path);
+  ck_free(dst_path);
+
+}
+
+static void select_seed_env_profile(char** argv, u8* env_id, u8 allow_parent_lookup,
+                                    const u8* seed_name) {
+
+  u8* wanted_env = env_id && *env_id ? env_id : NULL;
+  u8  found = 0;
+  u8  from_parent = 0;
+  u32 child_set = 0, child_unset = 0, child_verify_fail = 0;
+  u32 parent_set = 0, parent_unset = 0, parent_verify_fail = 0;
+  char child_summary[1024], parent_summary[1024];
+  char child_path[4096], parent_path[4096];
+  char child_reason[256], parent_reason[256];
+
+  child_summary[0] = 0;
+  parent_summary[0] = 0;
+  child_path[0] = 0;
+  parent_path[0] = 0;
+  child_reason[0] = 0;
+  parent_reason[0] = 0;
+
+  capture_seed_env_defaults();
+
+  if (!wanted_env && !current_seed_env_id) {
+    current_seed_env_from_parent = 0;
+    return;
+  }
+
+  if (wanted_env && current_seed_env_id && !strcmp((char*)wanted_env, (char*)current_seed_env_id)) {
+    current_seed_env_from_parent = 0;
+    return;
+  }
+
+  stop_forkserver();
+  restore_default_seed_env();
+
+  if (wanted_env && apply_seed_env_file(seed_env_child_dir, wanted_env,
+      &child_set, &child_unset, &child_verify_fail,
+      child_summary, sizeof(child_summary),
+      child_path, sizeof(child_path),
+      child_reason, sizeof(child_reason))) {
+    found = 1;
+  } else if (wanted_env && allow_parent_lookup &&
+             apply_seed_env_file(seed_env_parent_dir, wanted_env,
+               &parent_set, &parent_unset, &parent_verify_fail,
+               parent_summary, sizeof(parent_summary),
+               parent_path, sizeof(parent_path),
+               parent_reason, sizeof(parent_reason))) {
+    found = 1;
+    from_parent = 1;
+  }
+
+  if (current_seed_env_id) {
+    ck_free(current_seed_env_id);
+    current_seed_env_id = NULL;
+  }
+
+  if (found) current_seed_env_id = ck_strdup(wanted_env);
+  current_seed_env_from_parent = from_parent;
+
+  (void)argv;
+  (void)seed_name;
+
+}
+
+static void select_seed_env_for_queue(char** argv, struct queue_entry* q) {
+
+  if (q) select_seed_env_profile(argv, q->env_id, 0, q->fname);
+  else select_seed_env_profile(argv, NULL, 0, NULL);
+
+}
+
+static void select_seed_env_for_name(char** argv, const u8* name, u8 allow_parent_lookup) {
+
+  u8* env_id = extract_env_tag_from_name(name);
+  select_seed_env_profile(argv, env_id, allow_parent_lookup, name);
+  ck_free(env_id);
+
+}
+
 static void add_to_queue(u8* fname, u32 len, u8 passed_det) {
 
   struct queue_entry* q = ck_alloc(sizeof(struct queue_entry));
 
   q->fname        = fname;
+  q->env_id       = extract_env_tag_from_name(fname);
   q->len          = len;
   q->depth        = cur_depth + 1;
   q->passed_det   = passed_det;
@@ -2089,11 +2568,7 @@ EXP_ST void init_forkserver(char** argv) {
 
   if (pipe(st_pipe) || pipe(ctl_pipe)) PFATAL("pipe() failed");
 
-  printf("here b4 %d\n", getpid());
-
   forksrv_pid = fork();
-
-  printf("here after %d %d \n", getpid(), forksrv_pid);
 
   if (forksrv_pid < 0) PFATAL("fork() failed");
   
@@ -2142,9 +2617,6 @@ EXP_ST void init_forkserver(char** argv) {
        specified, stdin is /dev/null; otherwise, out_fd is cloned instead. */
 
    setsid();
-   printf("connecting up to stdout,\n");
-   // [WC] write to logfile
-
    u8 *outfilename, *errfilename;
 
    if (sync_id) {
@@ -2218,19 +2690,6 @@ EXP_ST void init_forkserver(char** argv) {
                            "allocator_may_return_null=1:"
                            "msan_track_origins=0", 0);
 
-    printf("[[[[AFL]]]]] we are getting to execv %s\n", target_path);
-    int index=0;    
-    printf("\tARGS\n");
-    char *s = *argv;
-    index =0;
-    for (; s; index++) {
-	printf("\t\t%s\n", s);
-	s = *(argv+index);
-    }
-    printf("\tSCRIPT_FILENAME=%s\n",getenv("SCRIPT_FILENAME"));
-    printf("\tAFL_PRELOAD=%s\n",getenv("AFL_PRELOAD"));
-    printf("\tLD_LIBRARY_PATH=%s\n", getenv("LD_LIBRARY_PATH"));
-    printf("\n");
     execv(target_path, argv);
 
     /* Use a distinctive bitmap signature to tell the parent about execv()
@@ -2264,10 +2723,7 @@ EXP_ST void init_forkserver(char** argv) {
   /* If we have a four-byte "hello" message from the server, we're all set.
      Otherwise, try to figure out what went wrong. */
 
-  printf("fs status=%ls %d ",&status, rlen);
-
   if (rlen == 4) {
-    printf("[AFL] Forkserver up\n");
     OKF("All right - fork server is up.");
     return;
   }
@@ -2280,7 +2736,6 @@ EXP_ST void init_forkserver(char** argv) {
   }
 
   if (WIFSIGNALED(status)) {
-
     if (mem_limit && mem_limit < 500 && uses_asan) {
 
       SAYF("\n" cLRD "[-] " cRST
@@ -2350,8 +2805,9 @@ EXP_ST void init_forkserver(char** argv) {
 
   }
 
-  if (*(u32*)trace_bits == EXEC_FAIL_SIG)
+  if (*(u32*)trace_bits == EXEC_FAIL_SIG) {
     FATAL("Unable to execute target application ('%s')", argv[0]);
+  }
 
   if (mem_limit && mem_limit < 500 && uses_asan) {
 
@@ -2406,6 +2862,8 @@ EXP_ST void init_forkserver(char** argv) {
 /* Execute target application, monitoring for timeouts. Return status
    information. The called program will update trace_bits[]. */
 
+static void maybe_sync_extsync(char** argv);
+
 static u8 run_target(char** argv, u32 timeout) {
 
   static struct itimerval it;
@@ -2413,6 +2871,11 @@ static u8 run_target(char** argv, u32 timeout) {
 
   int status = 0;
   u32 tb4;
+
+  maybe_sync_extsync(argv);
+
+  if (dumb_mode != 1 && !no_forkserver && !forksrv_pid)
+    init_forkserver(argv);
 
   child_timed_out = 0;
 
@@ -2706,6 +3169,8 @@ static u8 calibrate_case(char** argv, struct queue_entry* q, u8* use_mem,
   stage_name = "calibration";
   stage_max  = fast_cal ? 3 : CAL_CYCLES;
 
+  select_seed_env_for_queue(argv, q);
+
   /* Make sure the forkserver is up before we do anything, and let's not
      count its spin-up time toward binary calibration. */
 
@@ -2872,6 +3337,7 @@ static void perform_dry_run(char** argv) {
 
     close(fd);
 
+    select_seed_env_for_queue(argv, q);
     res = calibrate_case(argv, q, use_mem, 0, 1);
     ck_free(use_mem);
 
@@ -3142,9 +3608,14 @@ static void pivot_inputs(void) {
 #ifndef SIMPLE_FILES
 
       u8* use_name = strstr(rsl, ",orig:");
+      u8* env_tag = extract_env_tag_from_name(rsl);
 
       if (use_name) use_name += 6; else use_name = rsl;
-      nfn = alloc_printf("%s/queue/id:%06u,orig:%s", out_dir, id, use_name);
+      if (env_tag)
+        nfn = alloc_printf("%s/queue/id:%06u,orig:%s,env:%s", out_dir, id, use_name, env_tag);
+      else
+        nfn = alloc_printf("%s/queue/id:%06u,orig:%s", out_dir, id, use_name);
+      ck_free(env_tag);
 
 #else
 
@@ -3210,6 +3681,8 @@ static u8* describe_op(u8 hnb) {
   }
 
   if (hnb == 2) strcat(ret, ",+cov");
+  if (current_seed_env_id)
+    sprintf(ret + strlen(ret), ",env:%s", current_seed_env_id);
 
   return ret;
 
@@ -3297,6 +3770,16 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
 
 #endif /* ^!SIMPLE_FILES */
 
+    fd = open(fn, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    if (fd < 0) PFATAL("Unable to create '%s'", fn);
+    ck_write(fd, mem, len, fn);
+    close(fd);
+
+    /* Promote the env profile before calibration so queue-based lookup can
+       resolve it from the child table during calibrate_case(). */
+    maybe_promote_parent_env_to_child();
+    current_seed_env_from_parent = 0;
+
     add_to_queue(fn, len, 0);
 
     if (hnb == 2) {
@@ -3313,11 +3796,6 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
 
     if (res == FAULT_ERROR)
       FATAL("Unable to execute target application");
-
-    fd = open(fn, O_WRONLY | O_CREAT | O_EXCL, 0600);
-    if (fd < 0) PFATAL("Unable to create '%s'", fn);
-    ck_write(fd, mem, len, fn);
-    close(fd);
 
     keeping = 1;
 
@@ -3450,6 +3928,115 @@ keep_as_crash:
   ck_free(fn);
 
   return keeping;
+
+}
+
+
+/* Poll work_dir/extsync/queue on wall clock time, independent of AFL's
+   regular peer sync cadence. Imported cases still need to satisfy
+   save_if_interesting() before entering the local queue. */
+
+static void maybe_sync_extsync(char** argv) {
+
+  DIR* qd;
+  struct dirent* qd_ent;
+  u8 *qd_path = NULL, *qd_synced_path = NULL, *path;
+  u8 *old_syncing_party;
+  u8 *saved_env_id = NULL;
+  u64 now;
+  u32 min_accept = 0, next_min_accept;
+  u32 old_syncing_case;
+  s32 id_fd = -1, fd;
+
+  if (!extsync_ready || extsync_in_progress || !sync_id || !sync_dir || stop_soon)
+    return;
+
+  now = get_cur_time();
+  if (now - last_extsync_time < EXTSYNC_INTERVAL_MS) return;
+
+  last_extsync_time = now;
+
+  qd_path = alloc_printf("%s/%s/queue", sync_dir, EXTSYNC_DIRNAME);
+  qd = opendir(qd_path);
+  if (!qd) {
+    ck_free(qd_path);
+    return;
+  }
+
+  qd_synced_path = alloc_printf("%s/.synced/%s", out_dir, EXTSYNC_DIRNAME);
+  id_fd = open(qd_synced_path, O_RDWR | O_CREAT, 0600);
+  if (id_fd < 0) PFATAL("Unable to create '%s'", qd_synced_path);
+
+  if (read(id_fd, &min_accept, sizeof(u32)) > 0)
+    lseek(id_fd, 0, SEEK_SET);
+
+  next_min_accept = min_accept;
+  old_syncing_party = syncing_party;
+  old_syncing_case = syncing_case;
+  if (current_seed_env_id) saved_env_id = ck_strdup(current_seed_env_id);
+  extsync_in_progress = 1;
+
+  while ((qd_ent = readdir(qd))) {
+
+    struct stat st;
+
+    if (qd_ent->d_name[0] == '.' ||
+        sscanf(qd_ent->d_name, CASE_PREFIX "%06u", &syncing_case) != 1 ||
+        syncing_case < min_accept) continue;
+
+    if (syncing_case >= next_min_accept)
+      next_min_accept = syncing_case + 1;
+
+    path = alloc_printf("%s/%s", qd_path, qd_ent->d_name);
+    fd = open(path, O_RDONLY);
+    if (fd < 0) {
+      ck_free(path);
+      continue;
+    }
+
+    if (fstat(fd, &st)) PFATAL("fstat() failed");
+
+    if (st.st_size && st.st_size <= MAX_FILE) {
+
+      u8  fault;
+      u8* mem = mmap(0, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+
+      if (mem == MAP_FAILED) PFATAL("Unable to mmap '%s'", path);
+
+      select_seed_env_for_name(argv, (const u8*)qd_ent->d_name, 1);
+      write_to_testcase(mem, st.st_size);
+      fault = run_target(argv, exec_tmout);
+
+      if (stop_soon) {
+        munmap(mem, st.st_size);
+        close(fd);
+        ck_free(path);
+        break;
+      }
+
+      syncing_party = (u8*)EXTSYNC_DIRNAME;
+      queued_imported += save_if_interesting(argv, mem, st.st_size, fault);
+      syncing_party = old_syncing_party;
+
+      munmap(mem, st.st_size);
+
+    }
+
+    close(fd);
+    ck_free(path);
+
+  }
+
+  ck_write(id_fd, &next_min_accept, sizeof(u32), qd_synced_path);
+  close(id_fd);
+  closedir(qd);
+  ck_free(qd_path);
+  ck_free(qd_synced_path);
+  syncing_party = old_syncing_party;
+  syncing_case = old_syncing_case;
+  extsync_in_progress = 0;
+  select_seed_env_profile(argv, saved_env_id, 0, NULL);
+  ck_free(saved_env_id);
 
 }
 
@@ -5150,8 +5737,6 @@ static u32 build_base_bufs(u8* outbufvars[], u8* out_buf, int len){
       outbuf_allocs++;
       memcpy(outbufvars[zerocnt], out_buf+last, seg_len);
       outbufvars[zerocnt][seg_len] = '\x00';
-//          fprintf(aflout, "[WC-AFL] Copying %d chars '%s' from cliffhanger \n", seg_len, out_buf+last);
-//          fflush(aflout);
       zerocnt++;
     }
 
@@ -5162,36 +5747,6 @@ static u32 build_base_bufs(u8* outbufvars[], u8* out_buf, int len){
   return outbuf_allocs;
 }
 
-static void print_buf(FILE* aflout, u8* tweaked, int cur_len, u32 var_strlen[], char* header){
-  fprintf(aflout,"[WC-AFL] %s (%d) %d %d %d => \e[36m", header, cur_len, var_strlen[COOKIES], var_strlen[GETS], var_strlen[POSTS]);
-  int vstrcnt=0;
-  int var_type_cnt = 0;
-
-  for (int j=0; j < cur_len;j++){
-    if (vstrcnt == var_strlen[var_type_cnt]){
-      fprintf(aflout, "\e[0m");
-    }
-    if (tweaked[j] >= 0x20 && tweaked[j] < 0x7f){
-      fprintf(aflout,"%c",tweaked[j]);
-    } else {
-      if (tweaked[j] == 0x0){
-        fprintf(aflout,"\e[0m || ");
-      } else {
-        fprintf(aflout,"\\x%02x",tweaked[j]);
-      }
-
-    }
-    vstrcnt++;
-    if (tweaked[j] == 0x00){
-      fprintf(aflout, "\e[36m");
-      vstrcnt=0;
-      var_type_cnt++;
-    }
-
-  }
-  fprintf(aflout,"\e[0m<EOT>\n");
-  fflush (aflout);
-}
 static void free_var_array(u8* var_str[], int count){
   for (int i =0; i < count; i++){
     if (var_str[i]){
@@ -5201,29 +5756,10 @@ static void free_var_array(u8* var_str[], int count){
   
 }
 
-static void simp_pbuf(u32 length, u8* buf, FILE* aflout){
-
-  for (int j=0; j < length;j++){
-
-    if (buf[j]>= 0x20 && buf[j] < 0x7f){
-      fprintf(aflout,"%c",buf[j]);
-    } else {
-      if (buf[j] == 0x0){
-        fprintf(aflout," XxX ");
-      } else {
-        fprintf(aflout,"\\x%02x",buf[j]);
-      }
-
-    }
-  }
-  fflush (aflout);
-}
-
 static u32 build_buf_from_var(u8* var_str[], u32 var_strlen[], u8* outbufvars[], u8* tweaked){
   u32 cur_len =0;
   u8 *token = NULL;
   u8 *start = NULL;
-  FILE *tmpout  = fopen("/tmp/aflout-tmp.log","a+");  // DEBUG TO REMOVE
   
   // loop through all 3 types 
   for (int j=0; j < 3;j++){
@@ -5256,28 +5792,15 @@ static u32 build_buf_from_var(u8* var_str[], u32 var_strlen[], u8* outbufvars[],
           sprintf(regexpstr, "[\\^&]%s[^&]*", token+1);
         }
         reti = regcomp(&regex, regexpstr, 0);
-        if (reti) {
-          fprintf(tmpout, "[WC-AFL] Could not compile regex token='%s'\n", token+1);
-          fflush(tmpout);
-
-        } else {
+        if (!reti) {
             reti = regexec(&regex, currentob, 3, regmatch, 0);
           if (!reti) {
-            // token should always start with separator
-            fprintf(tmpout, "\tvar_str(%d)=%s, token=%s, token+1=%s ", var_strlen[j], var_str[j], token, token+1);
-            fprintf(tmpout, " strlen(currentob)=%ld MATCH = %d %d  '%s' ",strlen(currentob),  regmatch[0].rm_so, regmatch[0].rm_eo, regexpstr);
-            fflush(tmpout);
             int remaining_str_len = strlen(currentob + regmatch[0].rm_eo);
-            //fprintf(tmpout, " remain_size=%d '%s' ", remaining_str_len, currentob + regmatch[0].rm_eo);
-            //fflush(tmpout);
             memcpy(currentob+regmatch[0].rm_so, currentob + regmatch[0].rm_eo, remaining_str_len);
             int nullterm_pos = tlen-(regmatch[0].rm_eo-regmatch[0].rm_so);
             if (nullterm_pos < strlen(currentob)){
                 currentob[nullterm_pos] = '\x00';
             }
-
-//            fprintf(tmpout, "\n\tNEW(%d)='%s' \n\tOLD(%d)='%s'\n", strlen(currentob), currentob, tlen, outbufvars[j]);
-//            fflush(tmpout);
             tlen = strlen(outbufvars[j]);   // set tlen to new length without deleted variable
           }
         }
@@ -5301,25 +5824,17 @@ static u32 build_buf_from_var(u8* var_str[], u32 var_strlen[], u8* outbufvars[],
 
       cur_len += strlen(currentob);
 
-      fprintf(tmpout, "BEFORE free currentob of %p .....",currentob );
-      fflush(tmpout);
-
       free(currentob);
-      fprintf(tmpout, "  AFTER free currentob\n");
-      fflush(tmpout);
 
     }
 
     tweaked[cur_len] = '\x00';
     cur_len++;
     if (var_str[j] != NULL && start) {
-      fprintf(tmpout, " Freeing Start \n");
       free(start);
     }
     
   } // end for j 
-  fflush(tmpout);
-  fclose(tmpout);
   return cur_len;
 }
 
@@ -5340,8 +5855,6 @@ static u8 fuzz_one(char** argv) {
   u32 random_items, pick_len;
   s32 zeroPntCnt=0, last_optr=0, cur_pick_len = 0, last_zero_ptr=0;
   s32 optr, added_dist;
-  FILE *aflout_extras = NULL;
-  
   u8  ret_val = 1, doing_det = 0;
 
   u8  a_collect[MAX_AUTO_EXTRA];
@@ -5390,6 +5903,8 @@ static u8 fuzz_one(char** argv) {
          current_entry, queued_paths, unique_crashes);
     fflush(stdout);
   }
+
+  select_seed_env_for_queue(argv, queue_cur);
 
   /* Map the test case into memory. */
 
@@ -6470,9 +6985,6 @@ skip_extras:
 
   if (skip_http_dict) goto havoc_stage;
   
-  aflout_extras  = fopen("/tmp/aflout-extras.log","a+");  // DEBUG TO REMOVE
-  fprintf(aflout_extras, "[WC-AFL] ******* Processing HTTP Stage 1 ******** \n");
-
   stage_name  = "http queue comb";
   stage_short = "ext_HQC";
   stage_cur   = 0;
@@ -6485,9 +6997,6 @@ skip_extras:
   struct queue_entry *queue_search;
 
   queue_search = queue;
-
-  FILE *logfile2 = fopen("/tmp/afl_queue","a+");
-  fprintf(logfile2, "Starting http extras\n");
 
   u8 buffer[MAX_FILE];
   u8 vars[3][MAX_FILE];
@@ -6504,8 +7013,6 @@ skip_extras:
     for (int i=0; i < 3; i++){
       vars[i][0] = '\x00';
     }
-    fprintf(logfile2,"%s ",  queue_search->fname);
-
     FILE* qfn = fopen(queue_search->fname,"rb");
     if (qfn == NULL){
       queue_search = queue_search->next;
@@ -6526,10 +7033,7 @@ skip_extras:
         var_str_pos++;
         vars[var_type_cnt][var_str_pos] = '\x00';
       }
-      if (var_type_cnt == 3){  //don't care about values after POSTS section
-        fprintf(logfile2, "BREAKING OUT DOOODS!\n");
-        break;
-      }
+      if (var_type_cnt == 3) break;  //don't care about values after POSTS section
     }
 
     for(int i=0; i < 3;i++){
@@ -6537,8 +7041,6 @@ skip_extras:
       u8* token = starting_str;
       token = strtok(token, "&");
       u8 skip = 0;
-      fprintf(logfile2, "HERE\n");
-      fflush(logfile2);
       while (token != NULL){
         struct var_entry* cur_ve = vars_ll[i];
         while (cur_ve != NULL){
@@ -6550,13 +7052,7 @@ skip_extras:
         }
         cur_ve = NULL;
 
-        if (skip){
-          fprintf(logfile2, "\t SKIPPING %d = %s\n",i, token);
-
-        } else {
-
-          fprintf(logfile2, "\t Using %d = %s\n",i, token);
-          fflush(logfile2);
+        if (!skip) {
           add_var_to_ll(token, i);
           adds_to_ll++;
           length_added += strlen(token);
@@ -6570,7 +7066,6 @@ skip_extras:
     queue_search = queue_search->next;
     queue_elem_cnt++;
   } // end while queue_search of inputs
-  fprintf(logfile2,"[WC-AFL] Number of name-value pairs added to linked list = %d for %llu bytes queue eles= %llu\n", adds_to_ll, length_added, queue_elem_cnt);
 
 
     u8 keepgoing =1;
@@ -6582,7 +7077,6 @@ skip_extras:
 
     // let's use any new inputs
     if (qskip % 10 == 0) {
-      fprintf(aflout_extras, "[WC-AFL] Reseting queue ptr to run through entire queue\n");  // maybe better is randomly select a few queues.
       stopped_running_queue_at = NULL;  // queue is the bottom of the queue
     }
     // loop through vars_ll until we've exhausted all 3 COOKIES, GETs, POSTS at least once
@@ -6617,8 +7111,6 @@ skip_extras:
 
       // if all three have cycled at least once, then stop.
       if (keepgoing == 7){
-        fprintf(aflout_extras, "[WC-AFL] END OF LOOP cnt=%d keepgoing=%d skipcnt=%d \n", loopcnt-1, keepgoing, qskip);
-        fflush(aflout_extras);
         break;
       }
       
@@ -6641,16 +7133,9 @@ skip_extras:
       // run tweaked buffer without concatenating with other queue files.
       // this tests the tweaked (with a new var added from queue)
       int current_hit_cnt = queued_paths + unique_crashes;
-      if (common_fuzz_stuff(argv, tweaked, cur_len)) {
-        fprintf(aflout_extras, "Aborted and now freeing\n");
-        goto abandon_entry;
-      }
+      if (common_fuzz_stuff(argv, tweaked, cur_len)) goto abandon_entry;
       http_execs++;
-      if (current_hit_cnt != prior_round_hit_cnt){
-        print_buf(aflout_extras, tweaked, cur_len, var_strlen, "\e33m] OUT+VAR FOUND PATH\e[0m");
-        fflush(aflout_extras);
-        prior_round_hit_cnt=current_hit_cnt;
-      }
+      if (current_hit_cnt != prior_round_hit_cnt) prior_round_hit_cnt=current_hit_cnt;
 
       free_var_array(outbufvars, 3);
       ck_free(tweaked);
@@ -6702,21 +7187,13 @@ skip_extras:
         // build tweaked from var_str 
         cur_len = build_buf_from_var(var_str, var_strlen, outbufvars, tweaked);
 
-        prior_round_hit_cnt=queued_paths + unique_crashes;        
-        if (common_fuzz_stuff(argv, tweaked, cur_len)) {
-          fprintf(aflout_extras, "Aborted and now freeing\n");
-          goto abandon_entry;
-        }
+        prior_round_hit_cnt=queued_paths + unique_crashes;
+        if (common_fuzz_stuff(argv, tweaked, cur_len)) goto abandon_entry;
         
         current_hit_cnt = queued_paths + unique_crashes;
 
         http_execs++;
-        if (current_hit_cnt != prior_round_hit_cnt){
-          fprintf(aflout_extras, "[WC-AFL] \e[32m ADDED new input to QUEUE \e[0m Outbuf allocs = %d queue_size= %lld, loop count = %d, inner loop cnt = %u \n", outbufvars_allocs, queue_elem_cnt, loopcnt, inner_loopcnt);
-          fflush(aflout_extras);
-          //print_buf(aflout_extras, tweaked, cur_len, var_strlen, "\e[33m QUEUE+VAR FOUND PATH \e[0m");
-        }
-        //print_buf(aflout, tweaked, cur_len, var_strlen, "VAR+QUEUE");
+        if (current_hit_cnt != prior_round_hit_cnt) prior_round_hit_cnt=current_hit_cnt;
 
         qfilep++;
 
@@ -6727,9 +7204,6 @@ skip_extras:
         free_var_array(outbufvars, outbufvars_allocs);
 
       } // end while searching through all queue files for concat of the current var
-
-      fprintf(aflout_extras, "[WC-AFL] End of Inner Loop queue_size= %lld, loop count = %d, inner loop cnt = %u,  est totol_execs=%d \n", queue_elem_cnt, loopcnt, inner_loopcnt, (loopcnt*inner_loopcnt) );
-
       ck_free(qbuff);
       free_var_array(var_str, 3);
 
@@ -6742,10 +7216,6 @@ skip_extras:
     cur_var[POSTS] = NULL;
     cur_var[GETS] = NULL;
     cur_var[COOKIES] = NULL;
-
-    fprintf(logfile2,"\n");
-
-    fflush(logfile2);
 
   // clean up vars_ll
   int free_cnt = 0;
@@ -6762,15 +7232,9 @@ skip_extras:
     }
     vars_ll[i] = NULL;
   }
-  
-  fprintf(aflout_extras, "[WC-AFL] Number of entries not freed = %u and number frees performed = %d\n", entry_cnt, free_cnt);
-  
   new_hit_cnt = queued_paths + unique_crashes;
 
   stage_finds[STAGE_EXTRAS_HQC]  += new_hit_cnt - orig_hit_cnt;
-  fprintf(aflout_extras, "[WC-AFL] FINISHED http extras stage  Total Paths =%lld, Paths Gained=%lld, Total Paths gained from Stage =%lld\n"
-          ,new_hit_cnt, new_hit_cnt - orig_hit_cnt, stage_finds[STAGE_EXTRAS_HT]);
-
   stage_cycles[STAGE_EXTRAS_HQC] += stage_max;
 
 /*
@@ -6781,16 +7245,6 @@ skip_extras:
    * TODO: this might not need to be part of the non-deterministic group
    */
   http_dictionary_havoc_stage :
-  
-  if (aflout_extras == NULL){
-    aflout_extras  = fopen("/tmp/aflout-extras.log","a+");  // DEBUG TO REMOVE
-  }
-
-  if (sync_id){
-    fprintf(aflout_extras, "[WC-AFL] ******* Processing HTTP Stage 2 for %s ******** \n", sync_id);
-  } else {
-    fprintf(aflout_extras, "[WC-AFL] ******* Processing HTTP Stage 2 for MASTER ******** \n");
-  }
   
   if (skip_http_dict) goto havoc_stage;
 
@@ -6803,10 +7257,6 @@ skip_extras:
 
   orig_hit_cnt = queued_paths + unique_crashes;
   prior_round_hit_cnt = orig_hit_cnt;
-
-//  fprintf(aflout_extras, "[WC-AFL] Initial Input => \e[34m");
-//  simp_pbuf(len, out_buf, aflout_extras);
-//  fprintf(aflout_extras,"\e[0m\n");
 
   for (exptr = 0; exptr < extras_cnt; exptr++) {
     random_items = UR(10) + 1;
@@ -6832,8 +7282,6 @@ skip_extras:
     } // end for t
     add_on[add_on_len] = '\x00';
     add_on_len += 1;
-    //fprintf(aflout_extras, "\t Created Random list of args add_to len=%d   max=%d\n", add_on_len, extras[extras_cnt-1].len*random_items+2);
-
     // outbuf length + an add_on for cookies, get, and post
 
     last_zero_ptr = 0;
@@ -6841,10 +7289,7 @@ skip_extras:
       if (out_buf[optr] == '\x00'){
         zeroPntCnt++;
         last_zero_ptr = optr;
-        if (zeroPntCnt == 3){
-          fprintf(aflout_extras, "breaking out \n");
-          break;
-        }
+        if (zeroPntCnt == 3) break;
       }
     }
 
@@ -6863,12 +7308,10 @@ skip_extras:
     // if less than 3 null bytes appear in input, then tack on for the remaining.
     if (zeroPntCnt < 3 && len > 0){
       optr = len;
-      //fprintf(aflout_extras, "[WC-AFL] %d < 3 :: Tacking on unused out_buf cur_pick_len=%d, last_opt=%d, unused_len=%d\n", zeroPntCnt, cur_pick_len, last_optr, optr-last_optr);
       memcpy(pick_buf+cur_pick_len, out_buf+last_optr, optr-last_optr);
 
       added_dist = optr - last_optr;
       cur_pick_len += added_dist;
-      //fprintf(aflout_extras, "[WC-AFL] Adding add_on %d %d\n", cur_pick_len, add_on_len);
       memcpy(pick_buf+cur_pick_len, add_on, add_on_len);
       last_optr = optr+1;
       zeroPntCnt++;
@@ -6881,39 +7324,16 @@ skip_extras:
       cur_pick_len += add_on_len;
     } //end x
 
-    fflush(aflout_extras);
     ck_free(add_on);
-
-//    fprintf(aflout_extras, "[WC-AFL] Final Input => ");
-//    simp_pbuf(cur_pick_len, pick_buf, aflout_extras);
-//    fprintf(aflout_extras, " END TESTER VAR %d v %d maxlen=%d cur_pick_len=%d\n", add_on_len, t, pick_len, cur_pick_len);
-//
-//    fprintf(aflout_extras, "Pick_buf start=%p ender pos= %d,%d  val= %x\n", pick_buf, ALLOC_S(pick_buf), pick_len, ALLOC_C2(pick_buf));
-//    fflush(aflout_extras);
 
     int current_hit_cnt = queued_paths + unique_crashes;
     if (common_fuzz_stuff(argv, pick_buf, cur_pick_len)) {
-      fprintf(aflout_extras, "Aborted and now freeing\n");
       ck_free(pick_buf);
       goto abandon_entry;
     }
-    if (current_hit_cnt != prior_round_hit_cnt){
-      fprintf(aflout_extras,"\e[33m DICT FOUND PATH\e[0m ");
-      //simp_pbuf( cur_pick_len, pick_buf, aflout_extras);
-      prior_round_hit_cnt=current_hit_cnt;
-      //fprintf(aflout_extras, "\n\t\tTrimming %s %d ", queue_top->fname, queue_top->len);
-      //u8 trim_res = trim_case(argv, queue_top, in_buf);
-
-      //if (trim_res == FAULT_ERROR) {
-      //  FATAL("Unable to execute target application");
-      //}
-      //fprintf(aflout_extras, "\n\tShortened TO %d \n",  queue_top->len);
-    }
+    if (current_hit_cnt != prior_round_hit_cnt) prior_round_hit_cnt=current_hit_cnt;
 
     http_execs++;
-
-//    fprintf(aflout_extras, "Pick_buf start=%p ender pos= %d,%d  val= %x\n", pick_buf, ALLOC_S(pick_buf), pick_len, ALLOC_C2(pick_buf));
-//    fflush(aflout_extras);
 
     ck_free(pick_buf);
 
@@ -6924,17 +7344,12 @@ skip_extras:
   stage_finds[STAGE_EXTRAS_HT]  += new_hit_cnt - orig_hit_cnt;
   stage_cycles[STAGE_EXTRAS_HT] += stage_max;
 
-  fprintf(aflout_extras, "[WC-AFL] END of HTTP dictionary fuzzing\n");
-
   // The HTTP DICT routine tends to bloat the queue files, so we force a trim
 
 
   /*****************************
    * END HTTP Dictionary stuff
    *****************************/
-
-  fclose(aflout_extras);
-  aflout_extras = NULL;
 
   /****************
    * RANDOM HAVOC *
@@ -7550,7 +7965,9 @@ static void sync_fuzzers(char** argv) {
 
     /* Skip dot files and our own output directory. */
 
-    if (sd_ent->d_name[0] == '.' || !strcmp(sync_id, sd_ent->d_name)) continue;
+    if (sd_ent->d_name[0] == '.' ||
+        !strcmp(sync_id, sd_ent->d_name) ||
+        !strcmp(sd_ent->d_name, EXTSYNC_DIRNAME)) continue;
 
     /* Skip anything that doesn't have a queue/ subdirectory. */
 
@@ -7624,6 +8041,7 @@ static void sync_fuzzers(char** argv) {
         /* See what happens. We rely on save_if_interesting() to catch major
            errors and save the test case. */
 
+        select_seed_env_for_name(argv, (const u8*)qd_ent->d_name, 0);
         write_to_testcase(mem, st.st_size);
 
         fault = run_target(argv, exec_tmout);
@@ -8857,6 +9275,13 @@ int main(int argc, char** argv) {
   init_count_class16();
 
   setup_dirs_fds();
+  if (getenv("WC_ENV_PARENT_DIR"))
+    seed_env_parent_dir = ck_strdup(getenv("WC_ENV_PARENT_DIR"));
+  if (getenv("WC_ENV_CHILD_DIR")) {
+    seed_env_child_dir = ck_strdup(getenv("WC_ENV_CHILD_DIR"));
+    mkdir((char*)seed_env_child_dir, 0700);
+  }
+  capture_seed_env_defaults();
   read_testcases();
   load_auto();
 
@@ -8900,6 +9325,9 @@ int main(int argc, char** argv) {
     if (stop_soon) goto stop_fuzzing;
   }
 
+  last_extsync_time = get_cur_time();
+  extsync_ready = 1;
+
   while (1) {
 
     u8 skipped_fuzz;
@@ -8909,22 +9337,7 @@ int main(int argc, char** argv) {
     if (!queue_cur) {
 
       queue_cycle++;
-      current_entry     = 0;
       cur_skipped_paths = 0;
-      queue_cur         = queue;
-
-      while (seek_to) {
-        current_entry++;
-        seek_to--;
-        queue_cur = queue_cur->next;
-      }
-
-      show_stats();
-
-      if (not_on_tty) {
-        ACTF("Entering queue cycle %llu.", queue_cycle);
-        fflush(stdout);
-      }
 
       /* If we had a full queue cycle with no new finds, try
          recombination strategies next. */
@@ -8940,12 +9353,26 @@ int main(int argc, char** argv) {
       if (sync_id && queue_cycle == 1 && getenv("AFL_IMPORT_FIRST"))
         sync_fuzzers(use_argv);
 
+      rebuild_env_schedule();
+
+      if (seek_to) {
+        seek_env_schedule_to_index(seek_to);
+        seek_to = 0;
+      }
+
+      show_stats();
+
+      if (not_on_tty) {
+        ACTF("Entering queue cycle %llu.", queue_cycle);
+        fflush(stdout);
+      }
+
     }
    
     skipped_fuzz = fuzz_one(use_argv);
 
     if (!stop_soon && sync_id && !skipped_fuzz) {
-      
+
       if (!(sync_interval_cnt++ % SYNC_INTERVAL))
         sync_fuzzers(use_argv);
 
@@ -8955,8 +9382,7 @@ int main(int argc, char** argv) {
 
     if (stop_soon) break;
 
-    queue_cur = queue_cur->next;
-    current_entry++;
+    advance_env_schedule();
 
   }
 

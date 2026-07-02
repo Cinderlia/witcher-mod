@@ -58,6 +58,7 @@ class AFL(Phuzzer):
         super().__init__(target=target, seeds=seeds, dictionary=dictionary, create_dictionary=create_dictionary, timeout=timeout)
         self.log = logging.getLogger("phuzzer.phuzzers.afl")
         self.log.setLevel(logging.DEBUG)
+        self.container_targets = []
 
         self.work_dir = work_dir or os.path.join("/tmp", "phuzzer", os.path.basename(str(target)))
         print(f"Working Directory {self.work_dir}")
@@ -67,8 +68,20 @@ class AFL(Phuzzer):
         else:
             l.info("could resume, but starting over upon request")
             os.system(f"sudo chown {pwd.getpwuid( os.getuid() ).pw_uid}:{pwd.getpwuid( os.getuid() ).pw_uid} -R .")
-            with contextlib.suppress(FileNotFoundError):
-                shutil.rmtree(self.work_dir)
+            def _rmtree_retry(p):
+                for _ in range(3):
+                    try:
+                        shutil.rmtree(p)
+                        return
+                    except FileNotFoundError:
+                        return
+                    except OSError:
+                        time.sleep(0.2)
+                try:
+                    os.rename(p, p + ".old." + str(int(time.time())))
+                except Exception:
+                    return
+            _rmtree_retry(self.work_dir)
             self.in_dir = seeds_dir or os.path.join(self.work_dir, "initial_seeds")
             with contextlib.suppress(FileExistsError):
                 os.makedirs(self.in_dir, 0o777)
@@ -96,7 +109,6 @@ class AFL(Phuzzer):
         print(f"AFL bin path = {self.afl_phuzzer_bin_path}")
 
         self.container_info = container_info
-        self.container_targets = []
     #
     # Overrides
     #
@@ -141,6 +153,8 @@ class AFL(Phuzzer):
             with open(self.dictionary_file, "w") as df:
                 for i,s in enumerate(set(self.dictionary)):
                     if len(s) == 0:
+                        continue
+                    if len(s) > 128:
                         continue
                     s_val = hexescape(s)
                     df.write("string_%d=\"%s\"" % (i, s_val) + "\n")

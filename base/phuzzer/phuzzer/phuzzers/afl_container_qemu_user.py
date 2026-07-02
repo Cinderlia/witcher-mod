@@ -263,6 +263,25 @@ class WitcherAFL(AFL):
 
         return authdata
 
+    @staticmethod
+    def _preset_login_cookie_from_config(loginconfig: dict) -> str:
+        raw = str((loginconfig or {}).get("loginSessionCookie", "") or "").strip()
+        if not raw or "=" not in raw:
+            return ""
+        parts = []
+        ignore = {"path", "expires", "max-age", "domain", "secure", "httponly", "samesite", "priority"}
+        for part in raw.split(";"):
+            item = str(part or "").strip()
+            if not item or "=" not in item:
+                continue
+            key, value = item.split("=", 1)
+            key = str(key or "").strip()
+            value = str(value or "").strip()
+            if not key or key.lower() in ignore:
+                continue
+            parts.append(f"{key}={value}")
+        return "; ".join(parts)
+
     def _do_local_cgi_req_login(self, loginconfig):
 
         login_cmd = [loginconfig["cgiBinary"]]
@@ -410,6 +429,10 @@ class WitcherAFL(AFL):
         if jdata["direct"]["url"] == "NO_LOGIN":
             return
         loginconfig = jdata["direct"]
+        preset_login_cookie = self._preset_login_cookie_from_config(loginconfig)
+        if preset_login_cookie:
+            my_env["LOGIN_COOKIE"] = preset_login_cookie
+            return
 
         saved_session_id = self._get_saved_session()
         if len(saved_session_id) > 0:

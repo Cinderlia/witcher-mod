@@ -11,18 +11,36 @@ import {FoundRequest} from "./FoundRequest.js";
 function parseArgs(argv){
     let args = argv.slice(2);
     let headless = true;
+    let acceptFullParamsWithoutMinimization = false;
+    let fullParamsOutput = "";
     args = args.filter((a) => {
         if (a === "--no-headless"){
             headless = false;
             return false;
         }
+        if (a === "--accept-full-params-without-minimization"){
+            acceptFullParamsWithoutMinimization = true;
+            return false;
+        }
         return true;
     });
+    let nextArgs = [];
+    for (let i = 0; i < args.length; i++){
+        if (args[i] === "--full-params-output"){
+            if (i + 1 < args.length){
+                fullParamsOutput = args[i + 1];
+                i += 1;
+            }
+            continue;
+        }
+        nextArgs.push(args[i]);
+    }
+    args = nextArgs;
     if (args.length > 0 && (args[0] === "request_crawler" || args[0] === "request-crawler")){
         args = args.slice(1);
     }
     if (args.length < 4){
-        console.log("Usage:\n\tnode param_minimizer.js [request_crawler] BASE_SITE BASE_APPDIR URLS_TXT PARAMS_JSON [--no-headless]\n");
+        console.log("Usage:\n\tnode param_minimizer.js [request_crawler] BASE_SITE BASE_APPDIR URLS_TXT PARAMS_JSON [--no-headless] [--accept-full-params-without-minimization] [--full-params-output PATH]\n");
         process.exit(2);
     }
     return {
@@ -31,6 +49,8 @@ function parseArgs(argv){
         urlsTxt: args[2],
         paramsJson: args[3],
         headless,
+        acceptFullParamsWithoutMinimization,
+        fullParamsOutput,
     };
 }
 
@@ -121,6 +141,98 @@ function buildUrlWithGet(baseUrl, getParams){
     return u.href;
 }
 
+const FAST_SNIPPET_BYTES = 4096;
+const FAST_HEAD_TIMEOUT_MS = 1200;
+const FAST_MIN_NORMAL_BODY_BYTES = 320;
+
+function hasClearHtmlStructure(snippet){
+    const s = String(snippet || "").toLowerCase();
+    const markers = ["<html", "<body", "<main", "<form", "<table", "<section", "<article", "<nav", "<header", "<footer", "<div"];
+    let c = 0;
+    for (let i = 0; i < markers.length; i++){
+        if (s.includes(markers[i])){
+            c += 1;
+        }
+    }
+    return c >= 2;
+}
+
+function hasValuableErrorPage(snippet){
+    const s = String(snippet || "").toLowerCase();
+    const markers = [
+        "xdebug-error",
+        "call stack",
+        "warning:",
+        "notice:",
+        "fatal error",
+        "parse error",
+        "uncaught",
+        "stack trace",
+        "traceback",
+        "simplexml_load_string",
+        "trying to get property",
+        "on line <i>",
+        "xe-warning",
+        "xe-notice",
+        "xe-fatal-error"
+    ];
+    let hits = 0;
+    for (let i = 0; i < markers.length; i++){
+        if (s.includes(markers[i])){
+            hits += 1;
+        }
+    }
+    const hasErrorTable = s.includes("<table") && (s.includes("xdebug-error") || s.includes("call stack"));
+    return hits >= 2 || hasErrorTable;
+}
+
+function shouldStaticSkipUrl(rawUrl){
+    try{
+        const u = new URL(rawUrl);
+        const pathname = (u.pathname || "").toLowerCase();
+        const href = u.href.toLowerCase();
+        const ext = (pathname.match(/\.([a-z0-9]+)$/) || [null, ""])[1];
+        if (pathname.includes("/3rdparty/") || pathname.includes("/vendor/") || pathname.includes("/node_modules/") || pathname.includes("/tests/") || pathname.includes("/test/")){
+            return {skip:true, reason:"thirdparty-or-test"};
+        }
+        if ((pathname.includes("/src/") || pathname.includes("/lib/")) && pathname.endsWith(".php") && !pathname.endsWith("/index.php")){
+            return {skip:true, reason:"source-tree-php"};
+        }
+        const staticExt = new Set([
+            "js","css","map","png","jpg","jpeg","gif","svg","ico","webp","woff","woff2","ttf","eot","otf",
+            "pdf","zip","gz","tgz","bz2","7z","rar","tar","mp3","mp4","avi","mov","mkv","webm"
+        ]);
+        if (staticExt.has(ext)){
+            return {skip:true, reason:`static-ext:${ext}`};
+        }
+        if (/\/(logout|signout|logoff)(\/|$)|[?&](logout|signout|logoff)=/.test(href)){
+            return {skip:true, reason:"logout"};
+        }
+        if (/\/(help|docs|documentation|manual|faq|support)(\/|$)/.test(pathname)){
+            return {skip:true, reason:"help"};
+        }
+        if (/\/(download|exports?|attachment|attachments|file-download|dl)(\/|$)/.test(pathname)){
+            return {skip:true, reason:"download-endpoint"};
+        }
+        const keys = Array.from(u.searchParams.keys()).map(k => k.toLowerCase());
+        if (keys.length > 0){
+            const langKeys = new Set(["lang","language","locale","i18n","setlang","setlanguage"]);
+            if (keys.every(k => langKeys.has(k))){
+                return {skip:true, reason:"lang-switch"};
+            }
+            const pagingKeys = new Set(["page","p","offset","start","limit","per_page","perpage","pagesize","ipp"]);
+            if (keys.every(k => pagingKeys.has(k))){
+                return {skip:true, reason:"pure-pagination"};
+            }
+            if (keys.some(k => ["download","export","attachment","file","filename"].includes(k))){
+                return {skip:true, reason:"download-query"};
+            }
+        }
+    } catch(ex){
+    }
+    return {skip:false, reason:"-"};
+}
+
 async function ensureLoggedIn(page, appData, baseAppdir){
     let tmpApp = appData;
     tmpApp.requestsFound = {};
@@ -129,10 +241,26 @@ async function ensureLoggedIn(page, appData, baseAppdir){
     let re = new RequestExplorer(tmpApp, 0, baseAppdir, null);
     if (re.loginData !== undefined && "form_url" in re.loginData){
         try{
-            await re.do_login(page, {attachInterceptor:false});
+            let beforeUrl = "";
+            let beforeCookies = [];
+            try{ beforeUrl = await page.url(); } catch(ex){}
+            try{ beforeCookies = await page.cookies(); } catch(ex){}
+            console.log(`[PM-DEBUG] ensureLoggedIn start phase=${page.__phase || "-"} currentUrl=${beforeUrl || "-"} cookieCount=${Array.isArray(beforeCookies) ? beforeCookies.length : 0}`);
+            console.log(`[PM-DEBUG] ensureLoggedIn loginConfig form_url=${re.loginData.form_url || "-"} submitType=${re.loginData.submitType || "-"} userSel=${re.loginData.usernameSelector || "-"} passSel=${re.loginData.passwordSelector || "-"} submitSel=${re.loginData.form_submit_selector || "-"}`);
+            await re.do_login(page, {attachInterceptor:false, noProcessExit:true});
+            let afterUrl = "";
+            let afterCookies = [];
+            try{ afterUrl = await page.url(); } catch(ex){}
+            try{ afterCookies = await page.cookies(); } catch(ex){}
+            console.log(`[PM-DEBUG] ensureLoggedIn success phase=${page.__phase || "-"} currentUrl=${afterUrl || "-"} cookieCount=${Array.isArray(afterCookies) ? afterCookies.length : 0}`);
             return {performed:true, ok:true};
         } catch(ex){
-            return {performed:true, ok:false, err: (ex && ex.message) ? ex.message : String(ex)};
+            let failUrl = "";
+            let failCookies = [];
+            try{ failUrl = await page.url(); } catch(ex2){}
+            try{ failCookies = await page.cookies(); } catch(ex2){}
+            console.log(`[PM-DEBUG] ensureLoggedIn failed phase=${page.__phase || "-"} currentUrl=${failUrl || "-"} cookieCount=${Array.isArray(failCookies) ? failCookies.length : 0}`);
+            return {performed:true, ok:false, err: (ex && ex.stack) ? ex.stack : String(ex)};
         }
     }
     return {performed:false, ok:true};
@@ -150,15 +278,89 @@ function isInteractivePageQuiet(response, responseText){
             return false;
         }
     }
-    if (responseText.search(/<body[ >]/) > -1 || responseText.search(/<form[ >]/) > -1 || responseText.search(/<frameset[ >]/) > -1 ){
+    if (hasClearHtmlStructure(responseText) || responseText.search(/<frameset[ >]/) > -1){
         return true;
     }
     return false;
 }
 
-function createOverrideHandler(getOverride){
+function hasValuable5xxSignals(responseText){
+    const text = String(responseText || "").slice(0, FAST_SNIPPET_BYTES);
+    const lower = text.toLowerCase();
+    const businessIndicators = [
+        "sql", "mysql", "query", "select", "insert",
+        "warning:", "fatal error", "stack trace",
+        "line ", "file ", "/var/www",
+        "exception", "backtrace", "debug",
+        "sqlstate", "pdoexception", "database error", "db error",
+        "uncaught", "call stack", "traceback", "stacktrace",
+        "undefined index", "undefined variable", "notice:",
+        "parse error", "syntax error", "permission denied",
+        "not found in", "at line", "on line"
+    ];
+    let hit = [];
+    for (let i = 0; i < businessIndicators.length; i++){
+        const kw = businessIndicators[i];
+        if (lower.indexOf(kw) > -1){
+            hit.push(kw);
+        }
+    }
+    const hasBusiness = hit.length > 0;
+    const hasHtmlShell = lower.indexOf("<html") > -1 && lower.indexOf("<body") > -1;
+    const richHtmlMarkers = ["<form", "<table", "<script", "<main", "<section", "<article", "<nav", "<header", "<footer", "<title"];
+    let richCount = 0;
+    for (let i = 0; i < richHtmlMarkers.length; i++){
+        if (lower.indexOf(richHtmlMarkers[i]) > -1){
+            richCount += 1;
+        }
+    }
+    const hasStructuredHtml = hasHtmlShell && (richCount >= 3 || lower.length >= 1200);
+    return {ok: hasBusiness || hasStructuredHtml};
+}
+
+function createOverrideHandler(getOverride, getPhase){
     return async function(req){
         try{
+            const phase = getPhase ? getPhase() : "minimize";
+            if (phase !== "minimize"){
+                try{ req.continue(); } catch(e){}
+                return;
+            }
+            try{
+                if (req.isNavigationRequest() && req.redirectChain && req.redirectChain().length > 0){
+                    let isMainFrame = false;
+                    try{
+                        let fr = req.frame();
+                        isMainFrame = fr && fr.parentFrame && fr.parentFrame() === null;
+                    } catch(ex){
+                        isMainFrame = false;
+                    }
+                    if (isMainFrame){
+                        let status = 0;
+                        try{
+                            let chain = req.redirectChain();
+                            let prevReq = chain[chain.length - 1];
+                            let prevResp = prevReq ? prevReq.response() : null;
+                            status = prevResp ? prevResp.status() : 0;
+                        } catch(ex){
+                            status = 0;
+                        }
+                        if (req && req.frame){
+                            try{
+                                const fr = req.frame();
+                                const pg = fr && fr.page ? fr.page() : null;
+                                if (pg){
+                                    pg.__lastRedirectAbortInfo = {status};
+                                }
+                            } catch(ex){
+                            }
+                        }
+                        try{ req.abort(); } catch(e){}
+                        return;
+                    }
+                }
+            } catch(ex){
+            }
             let ov = getOverride();
             if (!ov){
                 try{ req.continue(); } catch(e){}
@@ -199,19 +401,214 @@ function withTimeout(promise, ms){
     });
 }
 
+async function waitForPmRelogin(page){
+    try{
+        if (page && typeof page.__pmWaitWhileRelogin === "function"){
+            await page.__pmWaitWhileRelogin();
+        }
+    } catch(ex){
+    }
+}
+
+async function fastFetchProbe(page, targetUrl, method, postData="", cookieHeader=""){
+    try{
+        await waitForPmRelogin(page);
+        return await page.evaluate(async ({url, m, timeoutMs, maxBytes, postBody, cookie}) => {
+            const ctrl = new AbortController();
+            const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+            try{
+                const reqHeaders = {};
+                if (cookie && String(cookie).trim().length > 0){
+                    reqHeaders["cookie"] = String(cookie);
+                }
+                if (m === "POST"){
+                    reqHeaders["content-type"] = "application/x-www-form-urlencoded";
+                }
+                const resp = await fetch(url, {
+                    method: m,
+                    redirect: "follow",
+                    credentials: "include",
+                    cache: "no-store",
+                    headers: reqHeaders,
+                    body: m === "POST" ? String(postBody || "") : undefined,
+                    signal: ctrl.signal
+                });
+                
+                const respHeaders = {};
+                resp.headers.forEach((v, k) => { respHeaders[String(k).toLowerCase()] = v; });
+                
+                let actualStatus = resp.status;
+                if (resp.redirected) {
+                    actualStatus = 302;
+                    respHeaders["location"] = resp.url;
+                } else if (actualStatus === 0 && resp.type === "opaqueredirect") {
+                    actualStatus = 302;
+                }
+                let snippet = "";
+                if (m !== "HEAD"){
+                    try{
+                        const txt = await resp.text();
+                        snippet = String(txt || "").slice(0, maxBytes);
+                    } catch(ex){
+                        snippet = "";
+                    }
+                }
+                return {ok:true, status:actualStatus, headers:respHeaders, snippet, finalUrl: resp.url || "", redirected: !!resp.redirected};
+            } catch (ex) {
+                return {ok:false, status:0, headers:{}, snippet:"", error:String(ex && ex.message ? ex.message : ex)};
+            } finally {
+                clearTimeout(timer);
+            }
+        }, {
+            url:targetUrl,
+            m:method,
+            timeoutMs:FAST_HEAD_TIMEOUT_MS,
+            maxBytes:FAST_SNIPPET_BYTES,
+            postBody:postData || "",
+            cookie:cookieHeader || ""
+        });
+    } catch(ex){
+        return {ok:false, status:0, headers:{}, snippet:"", error:String(ex && ex.message ? ex.message : ex)};
+    }
+}
+
+async function fastStatusProbe(page, targetUrl, method="GET", postData="", cookieHeader=""){
+    try{
+        await waitForPmRelogin(page);
+        return await page.evaluate(async ({url, m, timeoutMs, postBody, cookie}) => {
+            const ctrl = new AbortController();
+            const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+            try{
+                const reqHeaders = {};
+                if (cookie && String(cookie).trim().length > 0){
+                    reqHeaders["cookie"] = String(cookie);
+                }
+                if (m === "POST"){
+                    reqHeaders["content-type"] = "application/x-www-form-urlencoded";
+                }
+                const resp = await fetch(url, {
+                    method: m,
+                    redirect: "follow",
+                    credentials: "include",
+                    cache: "no-store",
+                    headers: reqHeaders,
+                    body: m === "POST" ? String(postBody || "") : undefined,
+                    signal: ctrl.signal
+                });
+                const respHeaders = {};
+                resp.headers.forEach((v, k) => { respHeaders[String(k).toLowerCase()] = v; });
+                let actualStatus = resp.status;
+                if (resp.redirected) {
+                    actualStatus = 302;
+                    respHeaders["location"] = resp.url;
+                } else if (actualStatus === 0 && resp.type === "opaqueredirect") {
+                    actualStatus = 302;
+                }
+                return {ok:true, status:actualStatus, headers:respHeaders, finalUrl: resp.url || "", redirected: !!resp.redirected};
+            } catch (ex) {
+                return {ok:false, status:0, headers:{}, error:String(ex && ex.message ? ex.message : ex), finalUrl:"", redirected:false};
+            } finally {
+                clearTimeout(timer);
+            }
+        }, {
+            url:targetUrl,
+            m:method,
+            timeoutMs:FAST_HEAD_TIMEOUT_MS,
+            postBody:postData || "",
+            cookie:cookieHeader || ""
+        });
+    } catch(ex){
+        return {ok:false, status:0, headers:{}, error:String(ex && ex.message ? ex.message : ex), finalUrl:"", redirected:false};
+    }
+}
+
+async function quickPrecheck(page, targetUrl, method="GET", postData="", cookieHeader="", baseUrl=""){
+    const urlToStaticallyCheck = baseUrl || targetUrl;
+    const staticSkip = shouldStaticSkipUrl(urlToStaticallyCheck);
+    if (staticSkip.skip){
+        return {skip:true, reason:staticSkip.reason, status:0, debug:{
+            stage:"static-skip",
+            targetUrl,
+            baseUrl:urlToStaticallyCheck,
+            method
+        }};
+    }
+    const g = await fastFetchProbe(page, targetUrl, method, postData, cookieHeader);
+    const snippet = String(g.snippet || "");
+    const ct = String((g.headers && g.headers["content-type"]) || "").toLowerCase();
+    const debug = {
+        stage:"probe",
+        targetUrl,
+        baseUrl:urlToStaticallyCheck,
+        method,
+        finalUrl: g.finalUrl || "",
+        redirected: !!g.redirected,
+        contentType: ct,
+        bodyLength: snippet.length,
+        hasClearHtmlStructure: hasClearHtmlStructure(snippet),
+        hasValuableErrorPage: hasValuableErrorPage(snippet),
+        snippetPreview: snippet.replace(/\s+/g, " ").slice(0, 300)
+    };
+    if (!g.ok){
+        return {skip:true, reason:"probe-failed", status:0, error: g.error, debug};
+    }
+    const status = g.status || 0;
+    const s = snippet.toLowerCase();
+    debug.status = status;
+    if (g.headers && g.headers.location){
+        debug.location = g.headers.location;
+    }
+    if (status >= 300 && status < 400){
+        return {skip:true, reason:"redirect", status, headers: g.headers, debug};
+    }
+    if (status === 0){
+        return {skip:true, reason:"opaque-redirect-or-network-error", status, headers: g.headers, debug};
+    }
+    if (status >= 400 && status < 500){
+        return {skip:true, reason:"4xx", status, headers: g.headers, debug};
+    }
+    if (status >= 500 && status < 600){
+        const ok5xx = hasValuable5xxSignals(g.snippet || "").ok;
+        debug.hasValuable5xxSignals = ok5xx;
+        return {skip:!ok5xx, reason: ok5xx ? "5xx-valuable" : "5xx-no-signal", status, headers: g.headers, debug};
+    }
+    if (ct.includes("application/json") || ct.includes("javascript") || ct.includes("text/css") || ct.startsWith("image/") || ct.startsWith("font/")){
+        return {skip:true, reason:"non-html", status, headers: g.headers, debug};
+    }
+    if (!(ct.includes("text/html") || ct.includes("text/plain") || ct === "")){
+        return {skip:true, reason:"non-interactive-ct", status, headers: g.headers, debug};
+    }
+    const bodyTooShort = s.trim().length > 0 && s.trim().length < FAST_MIN_NORMAL_BODY_BYTES;
+    if (bodyTooShort){
+        return {skip:true, reason:"short-body", status, headers: g.headers, debug};
+    }
+    const interactiveLike = hasClearHtmlStructure(s) || s.includes("<frameset") || hasValuableErrorPage(s);
+    debug.interactiveLike = interactiveLike;
+    return {skip:!interactiveLike, reason:interactiveLike ? "candidate" : "no-clear-html-structure", status, headers: g.headers, debug};
+}
+
 async function visit(page, targetUrl, method, postData, cookieHeader){
     let response = null;
     let responseText = "";
     try{
+        await waitForPmRelogin(page);
+        page.__lastRedirectAbortInfo = null;
         await page.setExtraHTTPHeaders(cookieHeader ? {"cookie": cookieHeader} : {});
-        if (method === "GET"){
-            response = await page.goto(targetUrl, {waitUntil:["domcontentloaded"], timeout: 30000});
-        } else {
-            page.__ov = {method:"POST", postData, cookieHeader, page};
-            response = await page.goto(targetUrl, {waitUntil:["domcontentloaded"], timeout: 30000});
+        try{
+            if (method === "GET"){
+                response = await page.goto(targetUrl, {waitUntil:["domcontentloaded"], timeout: 15000});
+            } else {
+                page.__ov = {method:"POST", postData, cookieHeader, page};
+                response = await page.goto(targetUrl, {waitUntil:["domcontentloaded"], timeout: 15000});
+            }
+        } finally {
             page.__ov = null;
         }
         if (!response){
+            if (page.__lastRedirectAbortInfo){
+                let status = page.__lastRedirectAbortInfo.status || 0;
+                return {ok:false, valuable:false, status, redirected:true};
+            }
             return {ok:false, valuable:false, status:0, redirected:false};
         }
         try{
@@ -224,13 +621,13 @@ async function visit(page, targetUrl, method, postData, cookieHeader){
                 ct = "";
             }
             if (ct.indexOf("text/") > -1 || ct.indexOf("html") > -1 || ct.indexOf("json") > -1){
-                responseText = await withTimeout(response.text(), 5000);
+                responseText = await withTimeout(response.text(), 3000);
             } else {
                 responseText = "";
             }
         } catch(ex){
             try{
-                responseText = await withTimeout(page.content(), 5000);
+                responseText = await withTimeout(page.content(), 3000);
             } catch(ex2){
                 responseText = "";
             }
@@ -254,14 +651,16 @@ async function visit(page, targetUrl, method, postData, cookieHeader){
         let hasBody = responseText && responseText.trim().length > 0;
         
         if (status >= 400){
-            // Even if status >= 400 (e.g. 500 Internal Server Error), 
-            // if the page has ANY response body, we consider it ok to save for fuzzing.
-            // (It may not be "valuable" for crawling, but it's valid for fuzzing).
-            if (hasBody) {
-                return {ok:true, valuable:valuable, status, redirected:false};
-            } else {
+            if (status >= 400 && status < 500){
                 return {ok:false, valuable:false, status, redirected:false};
             }
+            if (status >= 500 && status < 600){
+                if (hasBody && hasValuable5xxSignals(responseText).ok){
+                    return {ok:true, valuable:true, status, redirected:false};
+                }
+                return {ok:false, valuable:false, status, redirected:false};
+            }
+            return {ok:false, valuable:false, status, redirected:false};
         }
         
         return {ok:true, valuable, status, redirected:false};
@@ -275,62 +674,95 @@ async function minimizeForUrl(page, baseUrl, allGet, allPost, allCookie, baseSit
     let postParams = {...allPost};
     let cookieParams = {...allCookie};
 
-    let method = Object.keys(postParams).length > 0 ? "POST" : "GET";
-    let targetUrl = buildUrlWithGet(baseUrl, getParams);
-    let postBody = buildPostBody(postParams);
-    let cookieStr = buildCookieString(cookieParams);
-    let cookieHeader = mergeCookieHeaders(await cookiesToHeader(page, baseSite), cookieStr);
+    function totalParamCount(){
+        return Object.keys(postParams).length + Object.keys(cookieParams).length + Object.keys(getParams).length;
+    }
 
-    let baseRes = await visit(page, targetUrl, method, postBody, cookieHeader);
+    function removeKeys(obj, keys){
+        let saved = {};
+        for (let k of keys){
+            if (Object.prototype.hasOwnProperty.call(obj, k)){
+                saved[k] = obj[k];
+                delete obj[k];
+            }
+        }
+        return saved;
+    }
+
+    function restoreKeys(obj, saved){
+        for (let k of Object.keys(saved)){
+            obj[k] = saved[k];
+        }
+    }
+
+    async function testCurrent(){
+        let method = Object.keys(postParams).length > 0 ? "POST" : "GET";
+        let targetUrl = buildUrlWithGet(baseUrl, getParams);
+        let postBody = buildPostBody(postParams);
+        let cookieStr = buildCookieString(cookieParams);
+        let cookieHeader = mergeCookieHeaders(await cookiesToHeader(page, baseSite), cookieStr);
+        return await visit(page, targetUrl, method, postBody, cookieHeader);
+    }
+
+    async function reduceLinear(obj, keys){
+        for (let k of keys){
+            let saved = removeKeys(obj, [k]);
+            let r = await testCurrent();
+            if (r.ok && r.valuable){
+                continue;
+            }
+            restoreKeys(obj, saved);
+        }
+    }
+
+    async function reduceBisection(obj, keys){
+        async function rec(seg){
+            if (seg.length === 0){
+                return;
+            }
+            if (totalParamCount() < 10){
+                await reduceLinear(obj, seg);
+                return;
+            }
+            if (seg.length === 1){
+                let saved = removeKeys(obj, seg);
+                let r = await testCurrent();
+                if (r.ok && r.valuable){
+                    return;
+                }
+                restoreKeys(obj, saved);
+                return;
+            }
+            let mid = Math.floor(seg.length / 2);
+            let left = seg.slice(0, mid);
+            let right = seg.slice(mid);
+            let saved = removeKeys(obj, left);
+            let r = await testCurrent();
+            if (r.ok && r.valuable){
+                await rec(right);
+                return;
+            }
+            restoreKeys(obj, saved);
+            await rec(left);
+            await rec(right);
+        }
+        await rec(keys);
+    }
+
+    let baseRes = await testCurrent();
     if (!baseRes.ok || !baseRes.valuable){
-        return {result:"skip", stage:"base", ok:baseRes.ok, valuable:baseRes.valuable, status:baseRes.status, redirected:baseRes.redirected};
+        return {result:"skip", getParams, postParams, cookieParams, keepReason:"base-not-valuable-or-not-ok"};
     }
 
-    let keysGet = Object.keys(getParams);
-    for (let k of keysGet){
-        let saved = getParams[k];
-        delete getParams[k];
-        targetUrl = buildUrlWithGet(baseUrl, getParams);
-        postBody = buildPostBody(postParams);
-        cookieStr = buildCookieString(cookieParams);
-        cookieHeader = mergeCookieHeaders(await cookiesToHeader(page, baseSite), cookieStr);
-        let r = await visit(page, targetUrl, method, postBody, cookieHeader);
-        if (r.ok && r.valuable){
-            continue;
-        }
-        getParams[k] = saved;
+    if (totalParamCount() >= 10){
+        await reduceBisection(postParams, Object.keys(postParams));
+        await reduceBisection(cookieParams, Object.keys(cookieParams));
+        await reduceBisection(getParams, Object.keys(getParams));
     }
-
-    let keysPost = Object.keys(postParams);
-    for (let k of keysPost){
-        let saved = postParams[k];
-        delete postParams[k];
-        method = Object.keys(postParams).length > 0 ? "POST" : "GET";
-        targetUrl = buildUrlWithGet(baseUrl, getParams);
-        postBody = buildPostBody(postParams);
-        cookieStr = buildCookieString(cookieParams);
-        cookieHeader = mergeCookieHeaders(await cookiesToHeader(page, baseSite), cookieStr);
-        let r = await visit(page, targetUrl, method, postBody, cookieHeader);
-        if (r.ok && r.valuable){
-            continue;
-        }
-        postParams[k] = saved;
-    }
-
-    let keysCookie = Object.keys(cookieParams);
-    for (let k of keysCookie){
-        let saved = cookieParams[k];
-        delete cookieParams[k];
-        method = Object.keys(postParams).length > 0 ? "POST" : "GET";
-        targetUrl = buildUrlWithGet(baseUrl, getParams);
-        postBody = buildPostBody(postParams);
-        cookieStr = buildCookieString(cookieParams);
-        cookieHeader = mergeCookieHeaders(await cookiesToHeader(page, baseSite), cookieStr);
-        let r = await visit(page, targetUrl, method, postBody, cookieHeader);
-        if (r.ok && r.valuable){
-            continue;
-        }
-        cookieParams[k] = saved;
+    if (totalParamCount() < 10){
+        await reduceLinear(postParams, Object.keys(postParams));
+        await reduceLinear(cookieParams, Object.keys(cookieParams));
+        await reduceLinear(getParams, Object.keys(getParams));
     }
 
     return {result:"add", getParams, postParams, cookieParams};
@@ -349,6 +781,33 @@ function ensureAflRequestData(baseAppdir){
         data.inputSet = [];
     }
     return {fn, data};
+}
+
+function ensurePmProgress(baseAppdir){
+    let fn = path.join(baseAppdir, "param_minimizer_progress.json");
+    if (!fs.existsSync(fn)){
+        return {fn, data:{completed:{}}};
+    }
+    let data = JSON.parse(fs.readFileSync(fn, "utf8"));
+    if (!data || typeof data !== "object"){
+        data = {};
+    }
+    if (!data.completed || typeof data.completed !== "object"){
+        data.completed = {};
+    }
+    return {fn, data};
+}
+
+function markPmProgress(progressObj, url, status, error, location, debug){
+    let entry = {
+        done: true,
+        status: status || "done",
+        ts: Date.now()
+    };
+    if (error) entry.error = error;
+    if (location) entry.location = location;
+    if (debug && typeof debug === "object" && Object.keys(debug).length > 0) entry.debug = debug;
+    progressObj.completed[url] = entry;
 }
 
 function nextId(requestsFound){
@@ -406,6 +865,34 @@ function addRequestEntry(store, id, url, method, postData, headers){
     return true;
 }
 
+function addInputSetForParams(inputSetArr, getParams, postParams, cookieParams){
+    let kvs = [];
+    for (let k of Object.keys(getParams || {})){ kvs.push(`${k}=${getParams[k]}`); }
+    for (let k of Object.keys(postParams || {})){ kvs.push(`${k}=${postParams[k]}`); }
+    for (let k of Object.keys(cookieParams || {})){ kvs.push(`${k}=${cookieParams[k]}`); }
+    return addInputSet(inputSetArr, kvs);
+}
+
+function appendUniqueLine(linesArr, line){
+    const s = String(line || "").trim();
+    if (!s){
+        return;
+    }
+    if (!linesArr.includes(s)){
+        linesArr.push(s);
+    }
+}
+
+async function setupPmPage(page){
+    await page.setRequestInterception(true);
+    page.__ov = null;
+    page.__phase = "minimize";
+    page.__lastRedirectAbortInfo = null;
+    page.on("request", createOverrideHandler(() => page.__ov, () => page.__phase));
+    await page.setCacheEnabled(false);
+    await page.setDefaultNavigationTimeout(0);
+}
+
 async function main(){
     let cfg = parseArgs(process.argv);
     let urls = loadLines(cfg.urlsTxt);
@@ -426,65 +913,450 @@ async function main(){
         ]
     });
     const page = await browser.newPage();
-    await page.setRequestInterception(true);
-    page.__ov = null;
-    page.on("request", createOverrideHandler(() => page.__ov));
-    await page.setCacheEnabled(false);
-    await page.setDefaultNavigationTimeout(0);
+    await setupPmPage(page);
+    page.__phase = "login";
 
     let loginRes = await ensureLoggedIn(page, appData, cfg.baseAppdir);
+    try{
+        let lc = await page.cookies(cfg.baseSite);
+        console.log(`[PM] login_cookie_count=${Array.isArray(lc) ? lc.length : 0}`);
+        if (Array.isArray(lc) && lc.length > 0) {
+            console.log(`[PM] cookies: ${lc.map(c => c.name + '=' + c.value).join('; ')}`);
+        } else {
+            console.log(`[PM] warning: no cookies found for ${cfg.baseSite}. Requests will likely be redirected to login.php`);
+        }
+    } catch(ex){
+        console.log(`[PM] login_cookie_count=0 error=${ex}`);
+    }
     if (loginRes.performed){
         if (loginRes.ok){
             console.log(`[PM] login=ok`);
         } else {
             console.log(`[PM] login=fail err=${loginRes.err || ""}`);
+            await browser.close();
+            process.exit(4);
         }
     } else {
         console.log(`[PM] login=skip`);
     }
+    page.__phase = "minimize";
 
     let {fn, data} = ensureAflRequestData(cfg.baseAppdir);
+    let {fn: progressFn, data: progressData} = ensurePmProgress(cfg.baseAppdir);
     let reqs = data.requestsFound;
     let nid = nextId(reqs);
 
-    let added = 0;
-    for (let baseUrl of urls){
-        let t0 = Date.now();
-        let min = await withTimeout(minimizeForUrl(page, baseUrl, allGet, allPost, allCookie, cfg.baseSite), 45000).catch(() => null);
-        if (!min || min.result === "skip"){
-            let status = min && typeof min.status !== "undefined" ? min.status : 0;
-            let ms = Date.now() - t0;
-            let redir = min && min.redirected ? 1 : 0;
-            console.log(`[PM] url=${baseUrl} result=skip status=${status} redir=${redir} ms=${ms}`);
-            continue;
+    const loginCookies = await page.cookies(cfg.baseSite).catch(() => []);
+    const workerPages = [page];
+    for (let i = 1; i < 3; i++){
+        const wp = await browser.newPage();
+        await setupPmPage(wp);
+        if (Array.isArray(loginCookies) && loginCookies.length > 0){
+            try{ await wp.setCookie(...loginCookies); } catch(ex){}
         }
-        let urlWithGet = buildUrlWithGet(baseUrl, min.getParams);
-        let method = Object.keys(min.postParams).length > 0 ? "POST" : "GET";
-        let postData = buildPostBody(min.postParams);
-        let headers = buildCookieHeaderFromParams(min.cookieParams);
-        let wasAdded = addRequestEntry(reqs, nid, urlWithGet, method, postData, headers);
+        workerPages.push(wp);
+    }
+
+    let added = 0;
+    let skipCount = 0;
+    let resumeSkipCount = 0;
+    let idx = 0;
+    let fullParamAcceptedUrls = [];
+    
+    let isReloggingIn = false;
+    let loginRetryCount = 0;
+    let sessionEpoch = 1;
+    
+    function isAuthRelatedUrl(rawUrl){
+        try{
+            const u = new URL(String(rawUrl || ""), cfg.baseSite);
+            const p = `${u.pathname || ""}${u.search || ""}`.toLowerCase();
+            return p.includes("login") || p.includes("logout") || p.includes("signout") || p.includes("logoff") || p.includes("index.php");
+        } catch(ex){
+            const s = String(rawUrl || "").toLowerCase();
+            return s.includes("login") || s.includes("logout") || s.includes("signout") || s.includes("logoff") || s.includes("index.php");
+        }
+    }
+    
+    function isLoginExpiryRedirect(baseUrl, pre, configLoginUrl){
+        if (!pre || !pre.skip || pre.reason !== "redirect" || !pre.headers || !pre.headers.location){
+            return false;
+        }
+        if (isAuthRelatedUrl(baseUrl)){
+            return false;
+        }
+        const loc = String(pre.headers.location || "").toLowerCase();
+        const cfgLogin = String(configLoginUrl || "").toLowerCase();
+        const isMatchConfig = cfgLogin && (loc.endsWith(cfgLogin) || cfgLogin.endsWith(loc));
+        return !!(isMatchConfig || loc.includes("login") || loc.includes("index.php"));
+    }
+    
+    async function waitForReloginIdle(tag="") {
+        let announced = false;
+        while (isReloggingIn) {
+            if (!announced && tag){
+                console.log(`[PM-DEBUG] Waiting for re-login to finish before ${tag}...`);
+                announced = true;
+            }
+            await new Promise(r => setTimeout(r, 200));
+        }
+    }
+    for (let wp of workerPages) {
+        wp.__pmWaitWhileRelogin = () => waitForReloginIdle(`network activity on ${wp.__phase || "unknown-phase"}`);
+    }
+    
+    async function reLoginAllWorkers() {
+        if (isReloggingIn) {
+            console.log(`[PM] Already re-logging in. Waiting for other worker to finish...`);
+            let waitLimit = 60; // Wait up to 30 seconds
+            while (isReloggingIn && waitLimit > 0) {
+                await new Promise(r => setTimeout(r, 500));
+                waitLimit--;
+            }
+            return true;
+        }
+        
+        loginRetryCount++;
+        if (loginRetryCount > 5) {
+            console.log(`[PM] Max re-login attempts exceeded. Aborting re-login.`);
+            return false;
+        }
+        
+        isReloggingIn = true;
+        try {
+            console.log(`[PM] Detected login session expiration. Re-logging in...`);
+            console.log(`[PM-DEBUG] reLoginAllWorkers start retry=${loginRetryCount} workerCount=${workerPages.length}`);
+            
+            // Critical fix: We must clear the browser's persistent state and ensure we are on the login page
+            // BEFORE calling ensureLoggedIn, because input_sifter2's do_login expects a clean slate.
+            for (let wp of workerPages) {
+                try {
+                    wp.__phase = "login";
+                    let wpUrl = "";
+                    try{ wpUrl = await wp.url(); } catch(innerEx){}
+                    let oldCookies = await wp.cookies(cfg.baseSite);
+                    console.log(`[PM-DEBUG] Worker pre-relogin phase=${wp.__phase || "-"} url=${wpUrl || "-"} cookieCount=${Array.isArray(oldCookies) ? oldCookies.length : 0}`);
+                    if (oldCookies && oldCookies.length > 0) {
+                        await wp.deleteCookie(...oldCookies);
+                        console.log(`[PM-DEBUG] Cleared ${oldCookies.length} old cookies from a worker page.`);
+                    }
+                } catch(e){
+                    console.log(`[PM-DEBUG] Error clearing cookies: ${e}`);
+                }
+            }
+            
+            // Navigate the main page to about:blank to clear any weird DOM state/event listeners
+            try {
+                console.log(`[PM-DEBUG] Navigating main page to about:blank to reset DOM state...`);
+                await page.goto("about:blank", {waitUntil: "domcontentloaded", timeout: 5000});
+                console.log(`[PM-DEBUG] Main page reset successful. Initiating ensureLoggedIn...`);
+            } catch(e){
+                console.log(`[PM-DEBUG] Error navigating to about:blank: ${e}`);
+            }
+
+            let loginRes;
+            try {
+                loginRes = await ensureLoggedIn(page, appData, cfg.baseAppdir);
+            } catch (innerEx) {
+                console.log(`[PM-DEBUG] ensureLoggedIn threw an exception: ${innerEx.stack || innerEx}`);
+                loginRes = { ok: false, err: String(innerEx) };
+            }
+            if (!loginRes.ok) {
+                console.log(`[PM-DEBUG] Re-login failed internally: ${loginRes.err}`);
+                console.log(`[PM-DEBUG] Trying alternative fallback login strategy via worker pages...`);
+                // If main page failed, maybe it's completely stuck. Try using one of the worker pages instead.
+                if (workerPages.length > 1) {
+                    try {
+                        let fallbackPage = workerPages[1];
+                        fallbackPage.__phase = "login";
+                        await fallbackPage.goto("about:blank", {waitUntil: "domcontentloaded", timeout: 5000});
+                        let fallbackRes;
+                        try {
+                            fallbackRes = await ensureLoggedIn(fallbackPage, appData, cfg.baseAppdir);
+                        } catch (fallbackInnerEx) {
+                            console.log(`[PM-DEBUG] Fallback ensureLoggedIn threw: ${fallbackInnerEx.stack || fallbackInnerEx}`);
+                            fallbackRes = { ok: false, err: String(fallbackInnerEx) };
+                        }
+                        if (!fallbackRes.ok) {
+                            console.log(`[PM-DEBUG] Fallback re-login also failed: ${fallbackRes.err}`);
+                            return false;
+                        } else {
+                            console.log(`[PM-DEBUG] Fallback re-login succeeded on worker page!`);
+                            // Sync cookies back to main page and other workers
+                            const fallbackCookies = await fallbackPage.cookies(cfg.baseSite).catch(() => []);
+                            if (Array.isArray(fallbackCookies) && fallbackCookies.length > 0) {
+                                for (let wp of workerPages) {
+                                    wp.__phase = "minimize";
+                                    if (wp !== fallbackPage) {
+                                        try { await wp.setCookie(...fallbackCookies); } catch(ex){}
+                                    }
+                                }
+                                sessionEpoch += 1;
+                                console.log(`[PM] Re-login successful via fallback. New cookies distributed.`);
+                                return true;
+                            }
+                        }
+                    } catch(ex) {
+                        console.log(`[PM-DEBUG] Fallback exception: ${ex}`);
+                        return false;
+                    }
+                }
+                return false;
+            }
+            const newCookies = await page.cookies(cfg.baseSite).catch(() => []);
+            if (Array.isArray(newCookies) && newCookies.length > 0) {
+                for (let wp of workerPages) {
+                    wp.__phase = "minimize";
+                    if (wp !== page) {
+                        try { await wp.setCookie(...newCookies); } catch(ex){}
+                    }
+                }
+                sessionEpoch += 1;
+                console.log(`[PM] Re-login successful. New cookies distributed to all workers.`);
+                return true;
+            }
+            for (let wp of workerPages) {
+                wp.__phase = "minimize";
+            }
+            return false;
+        } finally {
+            for (let wp of workerPages) {
+                try{ wp.__phase = "minimize"; } catch(ex){}
+            }
+            isReloggingIn = false;
+        }
+    }
+
+    async function processOne(workerPage, baseUrl){
+        await waitForReloginIdle(`processing ${baseUrl}`);
+        if (progressData.completed && progressData.completed[baseUrl] && progressData.completed[baseUrl].done){
+            resumeSkipCount += 1;
+            return;
+        }
+        const localSessionEpoch = sessionEpoch;
+        const t0 = Date.now();
+        
+        const staticSkip = shouldStaticSkipUrl(baseUrl);
+        
+        let isLoginRedirect = false;
+        let loginUrl = "";
+        let configLoginUrl = "";
+        try {
+            let loginDataFile = path.join(cfg.baseAppdir, "login.json");
+            if (fs.existsSync(loginDataFile)) {
+                let ldata = JSON.parse(fs.readFileSync(loginDataFile, "utf8"));
+                configLoginUrl = ldata.form_url || "";
+            }
+        } catch (ex) {}
+
+        async function buildProgressDebug(pre, reqMethod, reqUrl, reqPostData, reqCookieHeader){
+            let currentUrl = "";
+            let pageCookieNames = [];
+            let pageCookieCount = 0;
+            try{ currentUrl = await workerPage.url(); } catch(ex){}
+            try{
+                const cks = await workerPage.cookies(cfg.baseSite);
+                pageCookieCount = Array.isArray(cks) ? cks.length : 0;
+                pageCookieNames = Array.isArray(cks) ? cks.map(c => c.name) : [];
+            } catch(ex){
+            }
+            return {
+                requestUrl: reqUrl,
+                requestMethod: reqMethod,
+                requestPostData: reqPostData || "",
+                requestCookieHeaderLength: String(reqCookieHeader || "").length,
+                workerPhase: workerPage.__phase || "",
+                workerCurrentUrl: currentUrl,
+                workerCookieCount: pageCookieCount,
+                workerCookieNames: pageCookieNames,
+                probe: pre && pre.debug ? pre.debug : undefined
+            };
+        }
+
+        async function tryAcceptFullParams(){
+            if (!cfg.acceptFullParamsWithoutMinimization){
+                return {accepted:false};
+            }
+            const hasAnyParam = Object.keys(allGet).length > 0 || Object.keys(allPost).length > 0 || Object.keys(allCookie).length > 0;
+            if (!hasAnyParam){
+                return {accepted:false};
+            }
+            const fullMethod = Object.keys(allPost).length > 0 ? "POST" : "GET";
+            const fullUrl = buildUrlWithGet(baseUrl, allGet);
+            const fullPostData = buildPostBody(allPost);
+            const runtimeCookieHeader = await cookiesToHeader(workerPage, cfg.baseSite);
+            const fullCookieHeader = mergeCookieHeaders(runtimeCookieHeader, buildCookieString(allCookie));
+            const fullPre = await quickPrecheck(workerPage, fullUrl, fullMethod, fullPostData, fullCookieHeader, baseUrl);
+            if (sessionEpoch !== localSessionEpoch){
+                console.log(`[PM-DEBUG] Discard stale full-param probe result for ${baseUrl}; session epoch changed ${localSessionEpoch}->${sessionEpoch}`);
+                return {retry:true};
+            }
+            if (isLoginExpiryRedirect(baseUrl, fullPre, configLoginUrl)){
+                console.log(`[PM-DEBUG] Login expiry suspected during full-param probe for ${baseUrl}. Triggering single global re-login.`);
+                let reLoginSuccess = await reLoginAllWorkers();
+                if (reLoginSuccess) {
+                    return {retry:true};
+                }
+            }
+            if (fullPre.skip){
+                return {accepted:false, probe:fullPre};
+            }
+
+            const headers = buildCookieHeaderFromParams(allCookie);
+            const id = nid;
+            nid += 1;
+            const wasAdded = addRequestEntry(reqs, id, fullUrl, fullMethod, fullPostData, headers);
+            if (wasAdded){
+                added += 1;
+            }
+            data.inputSet = addInputSetForParams(data.inputSet, allGet, allPost, allCookie);
+            appendUniqueLine(fullParamAcceptedUrls, fullUrl);
+            markPmProgress(progressData, baseUrl, "add-full-params", "", undefined, {
+                strategy: "accept-full-params-without-minimization",
+                requestUrl: fullUrl,
+                requestMethod: fullMethod,
+                requestPostData: fullPostData,
+                requestCookieHeaderLength: String(fullCookieHeader || "").length,
+                probe: fullPre.debug || undefined
+            });
+            fs.writeFileSync(progressFn, JSON.stringify(progressData, null, 2));
+            console.log(`[PM] add url=${baseUrl} method=${fullMethod} get=${Object.keys(allGet).length} post=${Object.keys(allPost).length} cookie=${Object.keys(allCookie).length} keepReason=full-params-without-minimization ms=${Date.now() - t0}`);
+            return {accepted:true};
+        }
+
+        if (staticSkip.skip){
+            skipCount += 1;
+            const debug = await buildProgressDebug({
+                debug:{
+                    stage:"static-skip",
+                    targetUrl: baseUrl,
+                    baseUrl,
+                    method:"GET",
+                    reason: staticSkip.reason
+                }
+            }, "GET", baseUrl, "", "");
+            markPmProgress(progressData, baseUrl, `pre-${staticSkip.reason}`, "", undefined, debug);
+            fs.writeFileSync(progressFn, JSON.stringify(progressData, null, 2));
+            console.log(`[PM] skip url=${baseUrl} reason=${staticSkip.reason} status=0 err= ms=${Date.now() - t0}`);
+            return;
+        }
+        
+        const baseCookieHeader = await cookiesToHeader(workerPage, cfg.baseSite);
+        const noParamPre = await quickPrecheck(workerPage, baseUrl, "GET", "", baseCookieHeader, baseUrl);
+        if (sessionEpoch !== localSessionEpoch){
+            console.log(`[PM-DEBUG] Discard stale no-param probe result for ${baseUrl}; session epoch changed ${localSessionEpoch}->${sessionEpoch}`);
+            return await processOne(workerPage, baseUrl);
+        }
+        
+        if (!noParamPre.skip){
+            const id = nid;
+            nid += 1;
+            const headers = baseCookieHeader ? {"cookie": baseCookieHeader} : {};
+            const wasAdded = addRequestEntry(reqs, id, baseUrl, "GET", "", headers);
+            if (wasAdded) added += 1;
+            console.log(`[PM] add url=${baseUrl} method=GET get=0 post=0 cookie=0 keepReason=pass-without-params ms=${Date.now() - t0}`);
+            markPmProgress(progressData, baseUrl, "add");
+            fs.writeFileSync(progressFn, JSON.stringify(progressData, null, 2));
+            return;
+        }
+        
+        if (noParamPre.status >= 400 && noParamPre.status < 600){
+            skipCount += 1;
+            const loc = noParamPre.headers && noParamPre.headers.location ? noParamPre.headers.location : undefined;
+            const debug = await buildProgressDebug(noParamPre, "GET", baseUrl, "", baseCookieHeader);
+            markPmProgress(progressData, baseUrl, `pre-${noParamPre.reason}`, noParamPre.error, loc, debug);
+            fs.writeFileSync(progressFn, JSON.stringify(progressData, null, 2));
+            console.log(`[PM] skip url=${baseUrl} reason=${noParamPre.reason} status=${noParamPre.status || 0} err=${noParamPre.error || ""} ms=${Date.now() - t0}`);
+            return;
+        }
+
+        try {
+            if (isLoginExpiryRedirect(baseUrl, noParamPre, configLoginUrl)) {
+                isLoginRedirect = true;
+                loginUrl = noParamPre.headers.location;
+            }
+        } catch (ex) {}
+
+        if (isLoginRedirect) {
+            console.log(`[PM-DEBUG] Login expiry suspected for ${baseUrl} redirecting to ${loginUrl || "-"}. Triggering single global re-login.`);
+            let reLoginSuccess = await reLoginAllWorkers();
+            if (reLoginSuccess) {
+                return await processOne(workerPage, baseUrl);
+            }
+        }
+
+        const fullParamAttempt = await tryAcceptFullParams();
+        if (fullParamAttempt.retry){
+            return await processOne(workerPage, baseUrl);
+        }
+        if (fullParamAttempt.accepted){
+            return;
+        }
+
+        let curGet = {...allGet};
+        let curPost = {...allPost};
+        let curCookie = {...allCookie};
+        await waitForReloginIdle(`minimizing ${baseUrl}`);
+        const min = await withTimeout(minimizeForUrl(workerPage, baseUrl, curGet, curPost, curCookie, cfg.baseSite), 25000).catch(() => null);
+        const finalMin = min && min.result === "add" ? min : {
+            result: "add",
+            getParams: {...curGet},
+            postParams: {...curPost},
+            cookieParams: {...curCookie},
+            keepReason: "min-timeout-or-error"
+        };
+        if (min && min.result === "skip"){
+            skipCount += 1;
+            const cookieHeader = mergeCookieHeaders(await cookiesToHeader(workerPage, cfg.baseSite), buildCookieString(curCookie));
+            const debug = await buildProgressDebug({
+                status: min.status || 0,
+                error: min.error,
+                headers: min.headers || {},
+                debug: {
+                    stage:"min-base-check",
+                    targetUrl: baseUrl,
+                    baseUrl,
+                    method: Object.keys(curPost).length > 0 ? "POST" : "GET",
+                    keepReason: min.keepReason || "base-not-valuable-or-not-ok"
+                }
+            }, Object.keys(curPost).length > 0 ? "POST" : "GET", buildUrlWithGet(baseUrl, curGet), buildPostBody(curPost), cookieHeader);
+            markPmProgress(progressData, baseUrl, `skip-${min.keepReason || "base-not-valuable-or-not-ok"}`, min.error || "", undefined, debug);
+            fs.writeFileSync(progressFn, JSON.stringify(progressData, null, 2));
+            console.log(`[PM] skip url=${baseUrl} reason=${min.keepReason || "base-not-valuable-or-not-ok"} status=${min.status || 0} err=${min.error || ""} ms=${Date.now() - t0}`);
+            return;
+        }
+        const urlWithGet = buildUrlWithGet(baseUrl, finalMin.getParams);
+        const method = Object.keys(finalMin.postParams).length > 0 ? "POST" : "GET";
+        const postData = buildPostBody(finalMin.postParams);
+        const headers = buildCookieHeaderFromParams(finalMin.cookieParams);
+        const id = nid;
         nid += 1;
+        const wasAdded = addRequestEntry(reqs, id, urlWithGet, method, postData, headers);
         if (wasAdded){
             added += 1;
         }
-        let ms = Date.now() - t0;
-        console.log(`[PM] url=${baseUrl} result=add method=${method} get=${Object.keys(min.getParams).length} post=${Object.keys(min.postParams).length} cookie=${Object.keys(min.cookieParams).length} ms=${ms}`);
-
-        let kvs = [];
-        for (let k of Object.keys(min.getParams)){
-            kvs.push(`${k}=${min.getParams[k]}`);
-        }
-        for (let k of Object.keys(min.postParams)){
-            kvs.push(`${k}=${min.postParams[k]}`);
-        }
-        for (let k of Object.keys(min.cookieParams)){
-            kvs.push(`${k}=${min.cookieParams[k]}`);
-        }
-        data.inputSet = addInputSet(data.inputSet, kvs);
+        console.log(`[PM] add url=${baseUrl} method=${method} get=${Object.keys(finalMin.getParams).length} post=${Object.keys(finalMin.postParams).length} cookie=${Object.keys(finalMin.cookieParams).length} keepReason=${finalMin.keepReason || "-"} ms=${Date.now() - t0}`);
+        data.inputSet = addInputSetForParams(data.inputSet, finalMin.getParams, finalMin.postParams, finalMin.cookieParams);
+        markPmProgress(progressData, baseUrl, "add");
+        fs.writeFileSync(progressFn, JSON.stringify(progressData, null, 2));
     }
+    async function workerLoop(workerPage){
+        while (true){
+            let cur = idx;
+            idx += 1;
+            if (cur >= urls.length){
+                break;
+            }
+            await processOne(workerPage, urls[cur]);
+        }
+    }
+    await Promise.all(workerPages.map(p => workerLoop(p)));
 
     fs.writeFileSync(fn, JSON.stringify(data, null, 2));
-    console.log(`[PM] completed urls_in=${urls.length} added=${added} afl_request_data=${fn}`);
+    if (cfg.fullParamsOutput){
+        fs.writeFileSync(cfg.fullParamsOutput, fullParamAcceptedUrls.join("\n") + (fullParamAcceptedUrls.length > 0 ? "\n" : ""), "utf8");
+    }
+    console.log(`[PM] completed urls_in=${urls.length} added=${added} skip=${skipCount} resume_skip=${resumeSkipCount} afl_request_data=${fn}`);
 
     await browser.close();
 }
