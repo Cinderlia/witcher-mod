@@ -1,0 +1,18 @@
+{
+  "seq_start": 0,
+  "seq_limit": 10000,
+  "buffer_token_limit": 3000,
+  "buffer_count": 1,
+  "max_analyze_concurrency": 5,
+  "test_mode": false,
+  "analyze_llm_test_mode": false,
+  "llm_max_attempts": 0,
+  "nearest_seq_count": 3,
+  "farthest_seq_count": 3,
+  "base_prompt": "",
+  "prompt_out_dir": "test/branch_selector/prompts",
+  "response_out_dir": "test/branch_selector/responses",
+  "trace_index_path": "tmp/trace_index.json",
+  "scope_root": "/app",
+  "windows_root": "D:\\files\\witcher\\app"
+}

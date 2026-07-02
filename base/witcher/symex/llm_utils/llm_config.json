@@ -1,0 +1,10 @@
+{
+  "base_url_cn": "https://endpoint.wendalog.com",
+  "base_url": "https://endpoint.greatrouter.com",
+  "api_key": "sk-gr-732508cbb5fa67c5caa372705dca82411f49c140",
+  "model": "gpt-5.4-nano",
+  "temperature": 0.2,
+  "timeout_s": 300.0,
+  "max_tokens": 8192,
+  "max_retries": 3
+}

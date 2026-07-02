@@ -143,20 +143,6 @@ def _extract_solution_sqls(solution: dict) -> list:
                     out.append(sql)
     return out
 
-def _extract_seed_id_from_path(path: str):
-    raw_path = str(path or "")
-    base = os.path.basename(raw_path.rstrip("/\\"))
-    m = re.match(r"id:(\d+)(?:,|$)", base)
-    if not m:
-        m = re.search(r"(?:^|[,/\\])id:(\d+)(?:,|$)", raw_path)
-    if not m:
-        return None
-    try:
-        return int(m.group(1))
-    except Exception:
-        return None
-
-
 def _build_finalize_solutions(runtime_cfg: DBSearchRuntimeConfig, state: DBSearchState, outcome):
     solutions = []
     for item in outcome.output_solutions or []:
@@ -175,13 +161,29 @@ def _write_external_seeds_for_finalize(runtime_cfg: DBSearchRuntimeConfig, state
     cfg = runtime_cfg.app_config
     defaults = load_symbolic_solution_defaults(cfg.find_input_file("test_command.txt"))
     seq = int(state.context.target_seq or 0)
-    return _write_external_seeds_from_solutions(
+    seed_paths = _write_external_seeds_from_solutions(
         solutions or [],
         cfg=cfg,
         seq=seq,
         defaults=defaults,
         logger=None,
     )
+    seed_records = []
+    for seed_path in seed_paths or []:
+        seed_path_s = str(seed_path or "").strip()
+        if not seed_path_s:
+            continue
+        base = os.path.basename(seed_path_s.rstrip("/\\"))
+        idx_match = re.search(r"(?:^|,)idx:(\d+)(?:,|$)", base)
+        id_match = re.match(r"id:(\d+)(?:,|$)", base)
+        seed_records.append(
+            {
+                "seed_path": seed_path_s,
+                "solution_index": (int(idx_match.group(1)) if idx_match else None),
+                "seed_id": (int(id_match.group(1)) if id_match else None),
+            }
+        )
+    return seed_records
 
 
 def _execute_finalize_queries(runtime_cfg: DBSearchRuntimeConfig, state: DBSearchState, outcome) -> list:
@@ -392,17 +394,18 @@ def run_finalize_phase(runtime_cfg: DBSearchRuntimeConfig, state: DBSearchState)
                     }
                     break
                 continue
-            external_seed_paths = _write_external_seeds_for_finalize(runtime_cfg, state, solutions)
+            external_seed_records = _write_external_seeds_for_finalize(runtime_cfg, state, solutions)
+            external_seed_paths = [str((item or {}).get("seed_path") or "") for item in (external_seed_records or []) if str((item or {}).get("seed_path") or "").strip()]
             sql_log_paths = []
             external_seed_by_index = {}
-            for seed_path in external_seed_paths or []:
-                m = re.search(r"idx:(\d+)", str(seed_path or ""))
-                if not m:
+            for item in external_seed_records or []:
+                if not isinstance(item, dict):
                     continue
-                try:
-                    external_seed_by_index[int(m.group(1))] = _extract_seed_id_from_path(seed_path)
-                except Exception:
+                solution_index = item.get("solution_index")
+                seed_id = item.get("seed_id")
+                if solution_index is None:
                     continue
+                external_seed_by_index[int(solution_index)] = seed_id
             for idx, solution in enumerate(solutions or [], 1):
                 sqls = _extract_solution_sqls(solution)
                 if not sqls:

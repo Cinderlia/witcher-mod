@@ -1,0 +1,78 @@
+{
+  "symex_enabled": true,
+  "app_name": "joomla-3.7",
+  "symbolic_seed_kinds": {
+    "POST": true,
+    "GET": true,
+    "COOKIE": true,
+    "SESSION": false,
+    "ENV": false,
+    "SQL": false,
+    "FILE": false
+  },
+  "paths": {
+    "input_dir": "input",
+    "tmp_dir": "tmp",
+    "test_dir": "test",
+    "output_dir": "output"
+  },
+  "branch_selector": {
+    "seq_start": 0,
+    "seq_limit": 20000,
+    "buffer_token_limit": 3000,
+    "buffer_count": 3,
+    "sql_buffer_token_limit": 3000,
+    "sql_buffer_count": 1,
+    "xss_buffer_token_limit": 3000,
+    "xss_buffer_count": 1,
+    "cmd_buffer_token_limit": 3000,
+    "cmd_buffer_count": 1,
+    "enable_if": true,
+    "enable_switch": true,
+    "enable_sql": true,
+    "enable_xss": true,
+    "enable_cmd": true,
+    "max_analyze_concurrency": 10,
+    "log_level": "INFO",
+    "if_branch_cache_skip": true,
+    "test_mode": false,
+    "analyze_llm_test_mode": false,
+    "llm_max_attempts": 0,
+    "llm_temperature": 0.7,
+    "nearest_seq_count": 3,
+    "farthest_seq_count": 3,
+    "base_prompt": "",
+    "prompt_out_dir": "test/branch_selector/prompts",
+    "response_out_dir": "test/branch_selector/responses",
+    "trace_index_path": "tmp/trace_index.json",
+    "scope_root": "/app",
+    "windows_root": "D:\\files\\witcher\\app"
+  },
+  "symex_scheduler": {
+    "max_analyze_procs": 10,
+    "max_branch_selector_procs": 1
+  },
+  "analyze_if_line": {
+    "test": false,
+    "debug": true,
+    "prompt": true,
+    "llm_temperature": 0.5
+  },
+  "symbolic_prompt": {
+    "llm_temperature": 0.5
+  },
+  "stats": {
+    "enabled": true
+  },
+  "symbolic_db": {
+    "engine": "mysql",
+    "host": "127.0.0.1",
+    "port": 3306,
+    "database": "joomla",
+    "username": "root",
+    "password": "",
+    "connect_timeout_sec": 3,
+    "query_timeout_sec": 5,
+    "max_rows": 50
+  }
+}
