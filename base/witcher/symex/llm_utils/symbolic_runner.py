@@ -24,6 +24,23 @@ from llm_utils.taint.taint_llm_calls import LLMCallFailure, chat_text_with_retri
 _FENCE_RE = re.compile(r"```(?:json)?\s*([\s\S]*?)\s*```", flags=re.IGNORECASE)
 
 
+def _append_symbolic_stage_debug(run_dir: str, event: str, **fields) -> None:
+    try:
+        logs_dir = os.path.join(os.path.abspath(run_dir), "logs")
+        os.makedirs(logs_dir, exist_ok=True)
+        payload = {
+            "event": str(event or ""),
+            "pid": int(os.getpid()),
+            "ppid": int(os.getppid()),
+        }
+        for k, v in (fields or {}).items():
+            payload[str(k)] = v
+        with open(os.path.join(logs_dir, "stage_debug.ndjson"), "a", encoding="utf-8", errors="replace") as f:
+            f.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+    except Exception:
+        pass
+
+
 def _asyncio_run(coro):
     runner = getattr(asyncio, "run", None)
     if runner is not None:
@@ -1035,12 +1052,14 @@ def _run_db_search_from_symbolic_request(
     final_output = dict(getattr(state, "final_output", {}) or {})
     solutions = final_output.get("solutions") if isinstance(final_output.get("solutions"), list) else []
     external_seed_paths = final_output.get("external_seed_paths") if isinstance(final_output.get("external_seed_paths"), list) else []
+    external_seed_records = final_output.get("external_seed_records") if isinstance(final_output.get("external_seed_records"), list) else []
     fatal_error = str(getattr(state, "fatal_error", "") or str(final_output.get("error") or "")).strip()
     return {
         "ok": not bool(fatal_error),
         "error": fatal_error,
         "solutions": [dict(x) for x in (solutions or []) if isinstance(x, dict)],
         "external_seed_paths": list(external_seed_paths or []),
+        "external_seed_records": [dict(x) for x in (external_seed_records or []) if isinstance(x, dict)],
         "db_search_run_dir": str(getattr(state, "run_dir", "") or ""),
         "sql_log_paths": list(getattr(state, "sql_log_paths", []) or []),
         "fatal_error_detail": dict(getattr(state, "fatal_error_detail", {}) or {}),
@@ -1056,13 +1075,16 @@ def run_symbolic_prompt(
     llm_offline: bool = False,
     logger=None,
 ) -> dict:
+    _append_symbolic_stage_debug(run_dir, "run_symbolic_prompt_enter", seq=int(seq), llm_offline=bool(llm_offline), prompt_len=len(prompt_text or ""))
     prompt_path = write_symbolic_prompt(prompt_text, run_dir=run_dir, seq=int(seq))
+    _append_symbolic_stage_debug(run_dir, "run_symbolic_prompt_prompt_written", seq=int(seq), prompt_path=str(prompt_path or ""))
     failure_dir = os.path.join(run_dir, "symbolic", "failed_responses")
     resp_dir = os.path.join(run_dir, "symbolic", "responses")
     raw_resp_path = os.path.join(resp_dir, f"symbolic_response_{int(seq)}.txt")
     json_resp_path = os.path.join(resp_dir, f"symbolic_response_{int(seq)}.json")
 
     if llm_offline:
+        _append_symbolic_stage_debug(run_dir, "run_symbolic_prompt_offline_enter", seq=int(seq), json_resp_exists=bool(os.path.exists(json_resp_path)), raw_resp_exists=bool(os.path.exists(raw_resp_path)))
         solutions = []
         if os.path.exists(json_resp_path):
             try:
@@ -1070,6 +1092,7 @@ def run_symbolic_prompt(
                 solutions = _normalize_solutions(obj2)
             except Exception:
                 solutions = []
+        _append_symbolic_stage_debug(run_dir, "run_symbolic_prompt_offline_return", seq=int(seq), solution_count=len(solutions or []))
         return {
             "prompt_path": prompt_path,
             "response_path": raw_resp_path if os.path.exists(raw_resp_path) else "",
@@ -1079,12 +1102,16 @@ def run_symbolic_prompt(
         }
 
     client = None
+    _append_symbolic_stage_debug(run_dir, "run_symbolic_prompt_before_client_init", seq=int(seq))
     try:
         client = get_default_client()
-    except Exception:
+    except Exception as exc:
+        _append_symbolic_stage_debug(run_dir, "run_symbolic_prompt_client_init_failed", seq=int(seq), error=str(exc))
         client = None
     if client is None:
+        _append_symbolic_stage_debug(run_dir, "run_symbolic_prompt_client_missing", seq=int(seq))
         raise RuntimeError("llm_client_init_failed")
+    _append_symbolic_stage_debug(run_dir, "run_symbolic_prompt_client_ready", seq=int(seq), client_type=type(client).__name__)
 
     max_attempts = 3
     try:
@@ -1115,6 +1142,7 @@ def run_symbolic_prompt(
     call_index = 0
     while True:
         call_index += 1
+        _append_symbolic_stage_debug(run_dir, "run_symbolic_prompt_call_enter", seq=int(seq), call_index=int(call_index), db_round_count=len(db_rounds or []))
         prompt_for_call = _build_prompt_with_db_feedback(prompt_text, db_rounds)
         prompt_path_for_call = prompt_path
         if call_index > 1:
@@ -1125,9 +1153,13 @@ def run_symbolic_prompt(
                 f"symbolic_prompt_{int(seq)}_db_round_{int(call_index - 1)}.txt",
             )
             _write_text(prompt_path_for_call, prompt_for_call)
+            _append_symbolic_stage_debug(run_dir, "run_symbolic_prompt_db_round_prompt_written", seq=int(seq), call_index=int(call_index), prompt_path=str(prompt_path_for_call or ""))
         try:
+            _append_symbolic_stage_debug(run_dir, "run_symbolic_prompt_before_asyncio_run", seq=int(seq), call_index=int(call_index), prompt_len=len(prompt_for_call or ""))
             response_text = _asyncio_run(_call(prompt_for_call, call_index))
+            _append_symbolic_stage_debug(run_dir, "run_symbolic_prompt_after_asyncio_run", seq=int(seq), call_index=int(call_index), response_len=len(response_text or ""))
         except LLMCallFailure as e:
+            _append_symbolic_stage_debug(run_dir, "run_symbolic_prompt_asyncio_run_failed", seq=int(seq), call_index=int(call_index), error=str(e))
             write_llm_failure_artifact(
                 failure_dir=failure_dir,
                 failure_name=f"symbolic_prompt_{int(seq)}_call_{int(call_index)}",
@@ -1140,7 +1172,9 @@ def run_symbolic_prompt(
                 },
             )
             raise
+        _append_symbolic_stage_debug(run_dir, "run_symbolic_prompt_before_db_extract", seq=int(seq), call_index=int(call_index), response_len=len(response_text or ""))
         db_request = _extract_db_request_from_text(response_text)
+        _append_symbolic_stage_debug(run_dir, "run_symbolic_prompt_after_db_request_extract", seq=int(seq), call_index=int(call_index), has_db_request=bool(db_request))
         if db_request:
             db_request_raw_path, db_request_json_path = write_symbolic_db_request_artifacts(
                 response_text,
@@ -1171,6 +1205,7 @@ def run_symbolic_prompt(
                 extra_payload["db_search"] = {
                     "triggered": True,
                     "external_seed_paths": list(db_search_result.get("external_seed_paths") or []),
+                    "external_seed_records": [dict(x) for x in (db_search_result.get("external_seed_records") or []) if isinstance(x, dict)],
                     "db_search_run_dir": str(db_search_result.get("db_search_run_dir") or ""),
                     "sql_log_paths": list(db_search_result.get("sql_log_paths") or []),
                     "request": dict(db_request or {}),
@@ -1191,6 +1226,7 @@ def run_symbolic_prompt(
                 }
             break
         db_query = _extract_db_query_from_text(response_text)
+        _append_symbolic_stage_debug(run_dir, "run_symbolic_prompt_after_db_query_extract", seq=int(seq), call_index=int(call_index), has_db_query=bool(db_query), db_round_count=len(db_rounds or []))
         if not db_query:
             break
         if len(db_rounds) >= int(max_db_rounds):
@@ -1232,7 +1268,9 @@ def run_symbolic_prompt(
             break
 
     response_text_for_parse = response_text if isinstance(response_text, str) else str(response_text or "")
+    _append_symbolic_stage_debug(run_dir, "run_symbolic_prompt_before_parse", seq=int(seq), response_len=len(response_text_for_parse or ""), used_solutions_override=bool(solutions_override), db_round_count=len(db_rounds or []))
     parsed_response_obj = list(solutions_override or []) if solutions_override else parse_symbolic_response(response_text_for_parse)
+    _append_symbolic_stage_debug(run_dir, "run_symbolic_prompt_after_parse", seq=int(seq), parsed_solution_count=len(parsed_response_obj or []))
     if logger is not None:
         try:
             logger.info(
@@ -1247,6 +1285,7 @@ def run_symbolic_prompt(
             )
         except Exception:
             pass
+    _append_symbolic_stage_debug(run_dir, "run_symbolic_prompt_before_write_response", seq=int(seq), parsed_solution_count=len(parsed_response_obj or []), has_db_search=bool(extra_payload.get("db_search")) if isinstance(extra_payload, dict) else False)
     raw_path, json_path = write_symbolic_response(
         response_text,
         run_dir=run_dir,
@@ -1255,6 +1294,7 @@ def run_symbolic_prompt(
         solutions_override=solutions_override,
         extra_payload=extra_payload,
     )
+    _append_symbolic_stage_debug(run_dir, "run_symbolic_prompt_after_write_response", seq=int(seq), raw_path=str(raw_path or ""), json_path=str(json_path or ""))
     resp_obj = list(parsed_response_obj or [])
     json_solutions_count = -1
     json_solutions_keys = []
@@ -1291,7 +1331,9 @@ def run_symbolic_prompt(
         "db_rounds": db_rounds,
         "llm_offline": False,
     }
+    _append_symbolic_stage_debug(run_dir, "run_symbolic_prompt_return", seq=int(seq), response_obj_count=len(resp_obj or []), json_solutions_count=int(json_solutions_count), db_round_count=len(db_rounds or []))
     if isinstance(extra_payload.get("db_search"), dict):
         out["db_search"] = dict(extra_payload.get("db_search") or {})
         out["external_seed_paths"] = list((extra_payload.get("db_search") or {}).get("external_seed_paths") or [])
+        out["external_seed_records"] = [dict(x) for x in ((extra_payload.get("db_search") or {}).get("external_seed_records") or []) if isinstance(x, dict)]
     return out

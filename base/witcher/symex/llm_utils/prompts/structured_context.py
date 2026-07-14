@@ -1,3 +1,5 @@
+import json
+import os
 import re
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -6,16 +8,47 @@ _FUNC_NAME_RE = re.compile(r"\bfunction\s+&?\s*([A-Za-z_\x80-\xff][A-Za-z0-9_\x8
 _DECL_TYPES = {"AST_FUNC_DECL", "AST_METHOD", "AST_CLOSURE"}
 
 
+def _append_structured_context_debug(mapped: list, event: str, **fields) -> None:
+    run_dir = ""
+    for it in mapped or []:
+        if not isinstance(it, dict):
+            continue
+        run_dir = str(it.get("__WITCHER_RUN_DIR__") or "").strip()
+        if run_dir:
+            break
+    if not run_dir:
+        return
+    payload = {
+        "event": str(event or ""),
+        "pid": int(os.getpid()),
+        "ppid": int(os.getppid()),
+    }
+    for k, v in (fields or {}).items():
+        payload[str(k)] = v
+    try:
+        logs_dir = os.path.join(os.path.abspath(run_dir), "logs")
+        os.makedirs(logs_dir, exist_ok=True)
+        with open(os.path.join(logs_dir, "stage_debug.ndjson"), "a", encoding="utf-8", errors="replace") as f:
+            f.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+    except Exception:
+        pass
+
+
 def structure_mapped_context(mapped: list, nodes: dict, parent_of: dict, top_id_to_file: dict) -> List[dict]:
+    _append_structured_context_debug(mapped, "sc_enter", mapped_count=len(mapped or []), node_count=len(nodes or {}), parent_count=len(parent_of or {}), top_file_count=len(top_id_to_file or {}))
     items = []
     for idx, it in enumerate(mapped or []):
         if not isinstance(it, dict):
             continue
         items.append({"_idx": int(idx), **it})
+    _append_structured_context_debug(mapped, "sc_items_built", item_count=len(items))
     if not items:
+        _append_structured_context_debug(mapped, "sc_empty_return")
         return list(mapped or [])
 
+    _append_structured_context_debug(mapped, "sc_before_build_loc_to_funcid", item_count=len(items))
     loc_to_func = _build_loc_to_funcid(items, nodes, parent_of, top_id_to_file)
+    _append_structured_context_debug(mapped, "sc_after_build_loc_to_funcid", loc_to_func_count=len(loc_to_func or {}))
     for it in items:
         loc = _loc_key(it)
         it["_funcid"] = loc_to_func.get(loc)
@@ -27,11 +60,13 @@ def structure_mapped_context(mapped: list, nodes: dict, parent_of: dict, top_id_
         if fid is None:
             continue
         func_groups.setdefault(int(fid), []).append(it)
+    _append_structured_context_debug(mapped, "sc_groups_built", global_item_count=len(global_items), func_group_count=len(func_groups))
 
     blocks = []
     global_remaining = list(global_items)
     global_used = set()
     for fid, group in func_groups.items():
+        _append_structured_context_debug(mapped, "sc_block_build_start", funcid=int(fid), group_count=len(group or []), global_remaining_count=len(global_remaining), global_used_count=len(global_used))
         decl = _pick_decl_line(group)
         func_name = _func_name_from_code((decl.get("code") if isinstance(decl, dict) else "") or "")
         callsites = _pick_callsites(global_remaining, func_name, used=global_used) if func_name else []
@@ -51,10 +86,12 @@ def structure_mapped_context(mapped: list, nodes: dict, parent_of: dict, top_id_
                 "decl_seq_key": decl_seq,
             }
         )
+        _append_structured_context_debug(mapped, "sc_block_build_done", funcid=int(fid), callsite_count=len(callsites or []), body_count=len(body or []), block_idx=int(block_idx))
 
     global_filtered = [it for it in global_remaining if it.get("_idx") not in global_used]
     global_filtered.sort(key=lambda x: int(x.get("_idx", 0)))
     blocks.sort(key=lambda b: int(b.get("_idx", 10**9)))
+    _append_structured_context_debug(mapped, "sc_merge_ready", global_filtered_count=len(global_filtered), block_count=len(blocks))
 
     out = []
     gi = 0
@@ -70,6 +107,7 @@ def structure_mapped_context(mapped: list, nodes: dict, parent_of: dict, top_id_
             out.append(_strip_meta(next_g))
             gi += 1
             continue
+    _append_structured_context_debug(mapped, "sc_merge_done", out_count=len(out), gi=int(gi), bi=int(bi))
     out_keys = {_item_key(x) for x in out if isinstance(x, dict)}
     missing = []
     for it in items:
@@ -79,8 +117,11 @@ def structure_mapped_context(mapped: list, nodes: dict, parent_of: dict, top_id_
             out_keys.add(k)
     if missing:
         out.extend(missing)
+    _append_structured_context_debug(mapped, "sc_missing_appended", missing_count=len(missing), out_count=len(out))
     if _has_decl(items) and not _has_decl(out):
+        _append_structured_context_debug(mapped, "sc_fallback_function_block")
         out = _fallback_function_block(items)
+    _append_structured_context_debug(mapped, "sc_return", out_count=len(out))
     return out
 
 
@@ -209,12 +250,26 @@ def _sort_seq_key(seq) -> int:
 
 
 def _build_loc_to_funcid(items: List[dict], nodes: dict, parent_of: dict, top_id_to_file: dict) -> Dict[tuple, int]:
+    _append_structured_context_debug(items, "sc_loc_to_funcid_enter", item_count=len(items or []), node_count=len(nodes or {}))
+    wanted_locs = set()
+    for it in items or []:
+        lk = _loc_key(it)
+        if lk is not None:
+            wanted_locs.add(lk)
+    _append_structured_context_debug(items, "sc_loc_to_funcid_targets", target_loc_count=len(wanted_locs))
+    if not wanted_locs:
+        _append_structured_context_debug(items, "sc_loc_to_funcid_return", node_iter_count=0, item_iter_count=0, by_loc_count=0, out_count=0)
+        return {}
+
+    wanted_lines = {int(line) for _, line in wanted_locs}
+    wanted_paths = {str(path) for path, _ in wanted_locs}
     by_loc = {}
+    node_iter_count = 0
+    matched_node_count = 0
     for nid, nx in (nodes or {}).items():
-        try:
-            nid_i = int(nid)
-        except Exception:
-            continue
+        node_iter_count += 1
+        if node_iter_count <= 3 or (node_iter_count % 200000) == 0:
+            _append_structured_context_debug(items, "sc_loc_to_funcid_node_progress", node_iter_count=int(node_iter_count), by_loc_count=len(by_loc), matched_node_count=int(matched_node_count))
         line = nx.get("lineno")
         if line is None:
             continue
@@ -222,13 +277,34 @@ def _build_loc_to_funcid(items: List[dict], nodes: dict, parent_of: dict, top_id
             line_i = int(line)
         except Exception:
             continue
-        path = _node_path(nid_i, nodes, parent_of, top_id_to_file)
-        if not path:
+        if line_i not in wanted_lines:
             continue
-        by_loc.setdefault((path, line_i), []).append(nid_i)
+        try:
+            nid_i = int(nid)
+        except Exception:
+            continue
+        path = _node_path(nid_i, nodes, parent_of, top_id_to_file)
+        if not path or path not in wanted_paths:
+            continue
+        lk = (path, line_i)
+        if lk not in wanted_locs:
+            continue
+        by_loc.setdefault(lk, []).append(nid_i)
+        matched_node_count += 1
+        if len(by_loc) == len(wanted_locs):
+            done = True
+            for target_lk in wanted_locs:
+                if not by_loc.get(target_lk):
+                    done = False
+                    break
+            if done:
+                _append_structured_context_debug(items, "sc_loc_to_funcid_early_stop", node_iter_count=int(node_iter_count), matched_node_count=int(matched_node_count), covered_loc_count=len(by_loc))
+                break
 
     out = {}
+    item_iter_count = 0
     for it in items or []:
+        item_iter_count += 1
         lk = _loc_key(it)
         if lk is None:
             continue
@@ -250,6 +326,7 @@ def _build_loc_to_funcid(items: List[dict], nodes: dict, parent_of: dict, top_id
                 continue
         if fid is not None and int(fid) > 0:
             out[lk] = int(fid)
+    _append_structured_context_debug(items, "sc_loc_to_funcid_return", node_iter_count=int(node_iter_count), item_iter_count=int(item_iter_count), by_loc_count=len(by_loc), out_count=len(out), matched_node_count=int(matched_node_count))
     return out
 
 

@@ -24,6 +24,60 @@ class _FinalizeRetrySQLFailure(object):
 from ..runtime_bridge import resolve_db_runtime_paths
 
 
+_FINALIZE_DANGEROUS_SQL_PATTERNS = [
+    re.compile(r"\bDROP\b", re.IGNORECASE),
+    re.compile(r"\bALTER\b", re.IGNORECASE),
+    re.compile(r"\bREVOKE\b", re.IGNORECASE),
+    re.compile(r"\bTRUNCATE\b", re.IGNORECASE),
+    re.compile(r"\bGRANT\b", re.IGNORECASE),
+    re.compile(r"\bSET\s+GLOBAL\b", re.IGNORECASE),
+    re.compile(r"\bKILL\b", re.IGNORECASE),
+    re.compile(r"\bUPDATE\s+mysql\.user\b", re.IGNORECASE),
+    re.compile(r"\bDELETE\s+FROM\s+mysql\.user\b", re.IGNORECASE),
+    re.compile(r"\bINSERT\s+INTO\s+mysql\.user\b", re.IGNORECASE),
+    re.compile(r"\bREPLACE\s+INTO\s+mysql\.user\b", re.IGNORECASE),
+    re.compile(r"\bCREATE\s+USER\b", re.IGNORECASE),
+    re.compile(r"\bALTER\s+USER\b", re.IGNORECASE),
+    re.compile(r"\bDROP\s+USER\b", re.IGNORECASE),
+    re.compile(r"\bRENAME\s+USER\b", re.IGNORECASE),
+    re.compile(r"\bSET\s+PASSWORD\b", re.IGNORECASE),
+    re.compile(r"\bGRANT\s+ALL\s+PRIVILEGES\b", re.IGNORECASE),
+]
+
+
+def _is_finalize_dangerous_sql(sql: str) -> bool:
+    sql_s = str(sql or "").strip()
+    if not sql_s:
+        return False
+    for pattern in _FINALIZE_DANGEROUS_SQL_PATTERNS:
+        if pattern.search(sql_s):
+            return True
+    return False
+
+
+def _filter_finalize_solution_sqls(solution: dict) -> dict:
+    if not isinstance(solution, dict):
+        return {}
+    out = dict(solution)
+    sql_value = out.get("SQL")
+    if isinstance(sql_value, str):
+        out["SQL"] = "" if _is_finalize_dangerous_sql(sql_value) else sql_value
+    elif isinstance(sql_value, (list, tuple)):
+        filtered = [item for item in sql_value if not _is_finalize_dangerous_sql(str((item if not isinstance(item, dict) else item.get("sql")) or ""))]
+        out["SQL"] = filtered
+    return out
+
+
+def _filter_finalize_db_actions(db_actions):
+    out = []
+    for action in (db_actions or []):
+        sql = str((action if isinstance(action, str) else getattr(action, "sql", "")) or "").strip()
+        if not sql or _is_finalize_dangerous_sql(sql):
+            continue
+        out.append(action)
+    return out
+
+
 def _query_allowed_in_finalize(state: DBSearchState) -> bool:
     return (int(state.finalize_rounds) + 1) <= 3
 
@@ -69,7 +123,7 @@ def _resolve_sql_log_dir(runtime_cfg: DBSearchRuntimeConfig, state: DBSearchStat
     return os.path.join(runtime_cfg.app_config.test_dir, "extsync", "db_runtime")
 
 
-def _archive_sql_mutations(runtime_cfg: DBSearchRuntimeConfig, state: DBSearchState, db_actions, *, seed_id=None) -> list:
+def _archive_sql_mutations(runtime_cfg: DBSearchRuntimeConfig, state: DBSearchState, db_actions, *, seed_id=None, undo_sqls=None) -> list:
     sqls = []
     for action in (db_actions or []):
         if isinstance(action, str):
@@ -78,6 +132,11 @@ def _archive_sql_mutations(runtime_cfg: DBSearchRuntimeConfig, state: DBSearchSt
             sql = str(getattr(action, "sql", "") or "").strip()
         if sql:
             sqls.append(sql)
+    undo_sql_list = []
+    for item in (undo_sqls or []):
+        sql = str(item or "").strip()
+        if sql:
+            undo_sql_list.append(sql)
     if not sqls:
         return []
     log_dir = _resolve_sql_log_dir(runtime_cfg, state)
@@ -101,6 +160,9 @@ def _archive_sql_mutations(runtime_cfg: DBSearchRuntimeConfig, state: DBSearchSt
     lines.append("-- new_seed_id: " + new_seed_text)
     lines.append("-- target_seq: " + seq)
     lines.append("-- phase: finalize")
+    lines.append("-- undo_sql_count: " + str(len(undo_sql_list)))
+    for undo_sql in undo_sql_list:
+        lines.append("-- undo_sql: " + undo_sql.rstrip(";") + ";")
     lines.append("")
     for sql in sqls:
         lines.append(sql.rstrip(";") + ";")
@@ -120,6 +182,8 @@ def _archive_sql_mutations(runtime_cfg: DBSearchRuntimeConfig, state: DBSearchSt
             "log_path": file_path,
             "sql_count": len(sqls),
             "sqls": list(sqls),
+            "undo_sql_count": len(undo_sql_list),
+            "undo_sqls": list(undo_sql_list),
         },
     )
     return [file_path]
@@ -147,11 +211,16 @@ def _build_finalize_solutions(runtime_cfg: DBSearchRuntimeConfig, state: DBSearc
     solutions = []
     for item in outcome.output_solutions or []:
         if isinstance(item, dict):
-            solutions.append(dict(item))
+            filtered = _filter_finalize_solution_sqls(dict(item))
+            if isinstance(filtered, dict):
+                solutions.append(filtered)
     if not solutions and isinstance(outcome.output_patch, dict) and outcome.output_patch:
-        solutions.append(dict(outcome.output_patch))
-    if not solutions and outcome.db_actions:
-        sqls = [str(plan.sql or "").strip() for plan in (outcome.db_actions or []) if str(plan.sql or "").strip()]
+        filtered = _filter_finalize_solution_sqls(dict(outcome.output_patch))
+        if isinstance(filtered, dict):
+            solutions.append(filtered)
+    filtered_db_actions = _filter_finalize_db_actions(outcome.db_actions or [])
+    if not solutions and filtered_db_actions:
+        sqls = [str(plan.sql or "").strip() for plan in filtered_db_actions if str(plan.sql or "").strip()]
         if sqls:
             solutions.append({"SQL": sqls})
     return [dict(item) for item in solutions if isinstance(item, dict)]
@@ -161,29 +230,22 @@ def _write_external_seeds_for_finalize(runtime_cfg: DBSearchRuntimeConfig, state
     cfg = runtime_cfg.app_config
     defaults = load_symbolic_solution_defaults(cfg.find_input_file("test_command.txt"))
     seq = int(state.context.target_seq or 0)
-    seed_paths = _write_external_seeds_from_solutions(
+    seed_records = _write_external_seeds_from_solutions(
         solutions or [],
         cfg=cfg,
         seq=seq,
         defaults=defaults,
         logger=None,
     )
-    seed_records = []
-    for seed_path in seed_paths or []:
-        seed_path_s = str(seed_path or "").strip()
-        if not seed_path_s:
+    seed_records_out = []
+    for item in (seed_records or []):
+        if not isinstance(item, dict):
             continue
-        base = os.path.basename(seed_path_s.rstrip("/\\"))
-        idx_match = re.search(r"(?:^|,)idx:(\d+)(?:,|$)", base)
-        id_match = re.match(r"id:(\d+)(?:,|$)", base)
-        seed_records.append(
-            {
-                "seed_path": seed_path_s,
-                "solution_index": (int(idx_match.group(1)) if idx_match else None),
-                "seed_id": (int(id_match.group(1)) if id_match else None),
-            }
-        )
-    return seed_records
+        seed_path = str(item.get("seed_path") or "").strip()
+        if not seed_path:
+            continue
+        seed_records_out.append(item)
+    return seed_records_out
 
 
 def _execute_finalize_queries(runtime_cfg: DBSearchRuntimeConfig, state: DBSearchState, outcome) -> list:
@@ -246,7 +308,7 @@ def _build_finalize_retry_payload(state: DBSearchState, action_executions) -> Fi
     )
 
 
-def _build_final_output_payload(state: DBSearchState, solutions, action_executions, sql_log_paths) -> dict:
+def _build_final_output_payload(state: DBSearchState, solutions, action_executions, sql_log_paths, external_seed_records=None) -> dict:
     solutions = [dict(item) for item in (solutions or []) if isinstance(item, dict)]
     db_action_results = []
     for execution in action_executions or []:
@@ -261,6 +323,7 @@ def _build_final_output_payload(state: DBSearchState, solutions, action_executio
     payload = {"solutions": solutions}
     payload["db_action_results"] = db_action_results
     payload["sql_log_paths"] = list(sql_log_paths or [])
+    payload["external_seed_records"] = [dict(item) for item in (external_seed_records or []) if isinstance(item, dict)]
     return payload
 
 
@@ -285,6 +348,34 @@ def run_finalize_phase(runtime_cfg: DBSearchRuntimeConfig, state: DBSearchState)
         query_allowed = _query_allowed_in_finalize(state)
         executions = []
         filtered_payloads = []
+        if bool(outcome.abandon):
+            state.finalize_rounds = round_index
+            state.output_ready = True
+            state.final_output = {
+                "abandon": True,
+                "rationale": str(outcome.rationale or ""),
+                "findings": list(outcome.findings or []),
+            }
+            append_jsonl_event(
+                run_dir=state.run_dir,
+                stream="events",
+                payload={
+                    "kind": "finalize_abandoned",
+                    "round_index": int(round_index),
+                    "rationale": str(outcome.rationale or ""),
+                },
+            )
+            state.round_traces.append(
+                RoundTrace(
+                    phase=PhaseName.FINALIZE,
+                    round_index=round_index,
+                    prompt_text=prompt_text,
+                    llm_response_text=response_text,
+                    executions=[],
+                    filtered_payloads=[],
+                )
+            )
+            break
         if query_allowed:
             executions = _execute_finalize_queries(runtime_cfg, state, outcome)
         else:
@@ -340,6 +431,7 @@ def run_finalize_phase(runtime_cfg: DBSearchRuntimeConfig, state: DBSearchState)
 
         if outcome.output_solutions or (isinstance(outcome.output_patch, dict) and outcome.output_patch) or outcome.db_actions:
             solutions = _build_finalize_solutions(runtime_cfg, state, outcome)
+            outcome.db_actions = _filter_finalize_db_actions(outcome.db_actions or [])
             action_executions = _execute_finalize_solution_sqls(runtime_cfg, state, solutions)
             executions.extend(action_executions)
             if state.round_traces:
@@ -406,15 +498,25 @@ def run_finalize_phase(runtime_cfg: DBSearchRuntimeConfig, state: DBSearchState)
                 if solution_index is None:
                     continue
                 external_seed_by_index[int(solution_index)] = seed_id
-            for idx, solution in enumerate(solutions or [], 1):
+            for idx0, solution in enumerate(solutions or []):
                 sqls = _extract_solution_sqls(solution)
                 if not sqls:
                     continue
+                undo_sqls = []
+                raw_undo = solution.get("undo_sql") if isinstance(solution, dict) else []
+                if isinstance(raw_undo, str):
+                    if raw_undo.strip():
+                        undo_sqls.append(raw_undo.strip())
+                elif isinstance(raw_undo, (list, tuple)):
+                    for item in raw_undo:
+                        if isinstance(item, str) and item.strip():
+                            undo_sqls.append(item.strip())
                 cur_log_paths = _archive_sql_mutations(
                     runtime_cfg,
                     state,
                     [type("TmpPlan", (), {"sql": sql})() for sql in sqls],
-                    seed_id=external_seed_by_index.get(int(idx)),
+                    seed_id=external_seed_by_index.get(int(idx0)),
+                    undo_sqls=undo_sqls,
                 )
                 sql_log_paths.extend(cur_log_paths)
             append_jsonl_event(
@@ -430,7 +532,7 @@ def run_finalize_phase(runtime_cfg: DBSearchRuntimeConfig, state: DBSearchState)
             )
             state.sql_log_paths.extend(sql_log_paths)
             state.output_ready = True
-            state.final_output = _build_final_output_payload(state, solutions, action_executions, sql_log_paths)
+            state.final_output = _build_final_output_payload(state, solutions, action_executions, sql_log_paths, external_seed_records=external_seed_records)
             state.final_output["external_seed_paths"] = list(external_seed_paths or [])
             break
         if not query_allowed:

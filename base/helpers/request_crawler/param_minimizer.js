@@ -144,17 +144,54 @@ function buildUrlWithGet(baseUrl, getParams){
 const FAST_SNIPPET_BYTES = 4096;
 const FAST_HEAD_TIMEOUT_MS = 1200;
 const FAST_MIN_NORMAL_BODY_BYTES = 320;
+const FAST_MIN_5XX_BODY_BYTES = 700;
+const FAST_MIN_TEXT_RATIO = 0.18;
 
-function hasClearHtmlStructure(snippet){
-    const s = String(snippet || "").toLowerCase();
-    const markers = ["<html", "<body", "<main", "<form", "<table", "<section", "<article", "<nav", "<header", "<footer", "<div"];
-    let c = 0;
-    for (let i = 0; i < markers.length; i++){
-        if (s.includes(markers[i])){
-            c += 1;
+function getHtmlQualitySignals(snippet){
+    const raw = String(snippet || "");
+    const s = raw.toLowerCase();
+    const hasDocType = s.includes("<!doctype html");
+    const hasHtmlOpen = s.includes("<html");
+    const hasHtmlClose = s.includes("</html>");
+    const hasHeadOpen = s.includes("<head");
+    const hasHeadClose = s.includes("</head>");
+    const hasBodyOpen = s.includes("<body");
+    const hasBodyClose = s.includes("</body>");
+    const structuralMarkers = ["<main", "<form", "<table", "<section", "<article", "<nav", "<header", "<footer", "<div"];
+    let structuralCount = 0;
+    for (let i = 0; i < structuralMarkers.length; i++){
+        if (s.includes(structuralMarkers[i])){
+            structuralCount += 1;
         }
     }
-    return c >= 2;
+    const textOnly = s.replace(/<script[\s\S]*?<\/script>/g, " ")
+        .replace(/<style[\s\S]*?<\/style>/g, " ")
+        .replace(/<[^>]+>/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+    const textRatio = raw.length > 0 ? textOnly.length / raw.length : 0;
+    const completeHtml = hasHtmlOpen && hasHtmlClose && hasHeadOpen && hasHeadClose && hasBodyOpen && hasBodyClose;
+    const semicompleteHtml = hasHtmlOpen && hasBodyOpen && hasBodyClose && structuralCount >= 2;
+    return {
+        completeHtml,
+        semicompleteHtml,
+        structuralCount,
+        textLength: textOnly.length,
+        textRatio,
+        hasDocType,
+        hasFrameset: s.includes("<frameset")
+    };
+}
+
+function hasClearHtmlStructure(snippet){
+    const q = getHtmlQualitySignals(snippet);
+    if (q.hasFrameset){
+        return true;
+    }
+    if (q.completeHtml){
+        return q.structuralCount >= 1 || q.textLength >= 120;
+    }
+    return q.semicompleteHtml && q.textLength >= 120 && q.textRatio >= FAST_MIN_TEXT_RATIO;
 }
 
 function hasValuableErrorPage(snippet){
@@ -305,17 +342,12 @@ function hasValuable5xxSignals(responseText){
             hit.push(kw);
         }
     }
+    const htmlQuality = getHtmlQualitySignals(text);
     const hasBusiness = hit.length > 0;
-    const hasHtmlShell = lower.indexOf("<html") > -1 && lower.indexOf("<body") > -1;
-    const richHtmlMarkers = ["<form", "<table", "<script", "<main", "<section", "<article", "<nav", "<header", "<footer", "<title"];
-    let richCount = 0;
-    for (let i = 0; i < richHtmlMarkers.length; i++){
-        if (lower.indexOf(richHtmlMarkers[i]) > -1){
-            richCount += 1;
-        }
-    }
-    const hasStructuredHtml = hasHtmlShell && (richCount >= 3 || lower.length >= 1200);
-    return {ok: hasBusiness || hasStructuredHtml};
+    const hasStructuredHtml = htmlQuality.completeHtml && htmlQuality.textLength >= 160;
+    const enoughBody = text.trim().length >= FAST_MIN_5XX_BODY_BYTES;
+    const ok = enoughBody && hasClearHtmlStructure(text) && (hasBusiness || hasStructuredHtml || hasValuableErrorPage(text));
+    return {ok, hitCount: hit.length, enoughBody, hasStructuredHtml, htmlQuality};
 }
 
 function createOverrideHandler(getOverride, getPhase){
@@ -536,6 +568,9 @@ async function quickPrecheck(page, targetUrl, method="GET", postData="", cookieH
     const g = await fastFetchProbe(page, targetUrl, method, postData, cookieHeader);
     const snippet = String(g.snippet || "");
     const ct = String((g.headers && g.headers["content-type"]) || "").toLowerCase();
+    const htmlQuality = getHtmlQualitySignals(snippet);
+    const clearHtml = hasClearHtmlStructure(snippet);
+    const valuableErrorPage = hasValuableErrorPage(snippet);
     const debug = {
         stage:"probe",
         targetUrl,
@@ -545,8 +580,9 @@ async function quickPrecheck(page, targetUrl, method="GET", postData="", cookieH
         redirected: !!g.redirected,
         contentType: ct,
         bodyLength: snippet.length,
-        hasClearHtmlStructure: hasClearHtmlStructure(snippet),
-        hasValuableErrorPage: hasValuableErrorPage(snippet),
+        hasClearHtmlStructure: clearHtml,
+        hasValuableErrorPage: valuableErrorPage,
+        htmlQuality,
         snippetPreview: snippet.replace(/\s+/g, " ").slice(0, 300)
     };
     if (!g.ok){
@@ -568,9 +604,10 @@ async function quickPrecheck(page, targetUrl, method="GET", postData="", cookieH
         return {skip:true, reason:"4xx", status, headers: g.headers, debug};
     }
     if (status >= 500 && status < 600){
-        const ok5xx = hasValuable5xxSignals(g.snippet || "").ok;
-        debug.hasValuable5xxSignals = ok5xx;
-        return {skip:!ok5xx, reason: ok5xx ? "5xx-valuable" : "5xx-no-signal", status, headers: g.headers, debug};
+        const signal5xx = hasValuable5xxSignals(g.snippet || "");
+        debug.hasValuable5xxSignals = signal5xx.ok;
+        debug.signal5xx = signal5xx;
+        return {skip:!signal5xx.ok, reason: signal5xx.ok ? "5xx-valuable" : "5xx-no-signal", status, headers: g.headers, debug};
     }
     if (ct.includes("application/json") || ct.includes("javascript") || ct.includes("text/css") || ct.startsWith("image/") || ct.startsWith("font/")){
         return {skip:true, reason:"non-html", status, headers: g.headers, debug};
@@ -578,13 +615,19 @@ async function quickPrecheck(page, targetUrl, method="GET", postData="", cookieH
     if (!(ct.includes("text/html") || ct.includes("text/plain") || ct === "")){
         return {skip:true, reason:"non-interactive-ct", status, headers: g.headers, debug};
     }
-    const bodyTooShort = s.trim().length > 0 && s.trim().length < FAST_MIN_NORMAL_BODY_BYTES;
+    const trimmedLength = s.trim().length;
+    const bodyTooShort = trimmedLength > 0 && trimmedLength < FAST_MIN_NORMAL_BODY_BYTES;
     if (bodyTooShort){
         return {skip:true, reason:"short-body", status, headers: g.headers, debug};
     }
-    const interactiveLike = hasClearHtmlStructure(s) || s.includes("<frameset") || hasValuableErrorPage(s);
-    debug.interactiveLike = interactiveLike;
-    return {skip:!interactiveLike, reason:interactiveLike ? "candidate" : "no-clear-html-structure", status, headers: g.headers, debug};
+    if (!clearHtml){
+        return {skip:true, reason:"no-clear-html-structure", status, headers: g.headers, debug};
+    }
+    const lowTextDensity = htmlQuality.textRatio > 0 && htmlQuality.textRatio < FAST_MIN_TEXT_RATIO;
+    if (lowTextDensity && !valuableErrorPage){
+        return {skip:true, reason:"low-text-density", status, headers: g.headers, debug};
+    }
+    return {skip:false, reason:"candidate", status, headers: g.headers, debug};
 }
 
 async function visit(page, targetUrl, method, postData, cookieHeader){
@@ -1173,57 +1216,6 @@ async function main(){
             };
         }
 
-        async function tryAcceptFullParams(){
-            if (!cfg.acceptFullParamsWithoutMinimization){
-                return {accepted:false};
-            }
-            const hasAnyParam = Object.keys(allGet).length > 0 || Object.keys(allPost).length > 0 || Object.keys(allCookie).length > 0;
-            if (!hasAnyParam){
-                return {accepted:false};
-            }
-            const fullMethod = Object.keys(allPost).length > 0 ? "POST" : "GET";
-            const fullUrl = buildUrlWithGet(baseUrl, allGet);
-            const fullPostData = buildPostBody(allPost);
-            const runtimeCookieHeader = await cookiesToHeader(workerPage, cfg.baseSite);
-            const fullCookieHeader = mergeCookieHeaders(runtimeCookieHeader, buildCookieString(allCookie));
-            const fullPre = await quickPrecheck(workerPage, fullUrl, fullMethod, fullPostData, fullCookieHeader, baseUrl);
-            if (sessionEpoch !== localSessionEpoch){
-                console.log(`[PM-DEBUG] Discard stale full-param probe result for ${baseUrl}; session epoch changed ${localSessionEpoch}->${sessionEpoch}`);
-                return {retry:true};
-            }
-            if (isLoginExpiryRedirect(baseUrl, fullPre, configLoginUrl)){
-                console.log(`[PM-DEBUG] Login expiry suspected during full-param probe for ${baseUrl}. Triggering single global re-login.`);
-                let reLoginSuccess = await reLoginAllWorkers();
-                if (reLoginSuccess) {
-                    return {retry:true};
-                }
-            }
-            if (fullPre.skip){
-                return {accepted:false, probe:fullPre};
-            }
-
-            const headers = buildCookieHeaderFromParams(allCookie);
-            const id = nid;
-            nid += 1;
-            const wasAdded = addRequestEntry(reqs, id, fullUrl, fullMethod, fullPostData, headers);
-            if (wasAdded){
-                added += 1;
-            }
-            data.inputSet = addInputSetForParams(data.inputSet, allGet, allPost, allCookie);
-            appendUniqueLine(fullParamAcceptedUrls, fullUrl);
-            markPmProgress(progressData, baseUrl, "add-full-params", "", undefined, {
-                strategy: "accept-full-params-without-minimization",
-                requestUrl: fullUrl,
-                requestMethod: fullMethod,
-                requestPostData: fullPostData,
-                requestCookieHeaderLength: String(fullCookieHeader || "").length,
-                probe: fullPre.debug || undefined
-            });
-            fs.writeFileSync(progressFn, JSON.stringify(progressData, null, 2));
-            console.log(`[PM] add url=${baseUrl} method=${fullMethod} get=${Object.keys(allGet).length} post=${Object.keys(allPost).length} cookie=${Object.keys(allCookie).length} keepReason=full-params-without-minimization ms=${Date.now() - t0}`);
-            return {accepted:true};
-        }
-
         if (staticSkip.skip){
             skipCount += 1;
             const debug = await buildProgressDebug({
@@ -1285,11 +1277,39 @@ async function main(){
             }
         }
 
-        const fullParamAttempt = await tryAcceptFullParams();
-        if (fullParamAttempt.retry){
+        const hasAnyParam = Object.keys(allGet).length > 0 || Object.keys(allPost).length > 0 || Object.keys(allCookie).length > 0;
+        if (!hasAnyParam){
+            skipCount += 1;
+            const debug = await buildProgressDebug(noParamPre, "GET", baseUrl, "", baseCookieHeader);
+            markPmProgress(progressData, baseUrl, `skip-${noParamPre.reason || "no-params-and-no-value"}`, noParamPre.error, undefined, debug);
+            fs.writeFileSync(progressFn, JSON.stringify(progressData, null, 2));
+            console.log(`[PM] skip url=${baseUrl} reason=${noParamPre.reason || "no-params-and-no-value"} status=${noParamPre.status || 0} err=${noParamPre.error || ""} ms=${Date.now() - t0}`);
+            return;
+        }
+
+        const fullMethod = Object.keys(allPost).length > 0 ? "POST" : "GET";
+        const fullUrl = buildUrlWithGet(baseUrl, allGet);
+        const fullPostData = buildPostBody(allPost);
+        const fullCookieHeader = mergeCookieHeaders(await cookiesToHeader(workerPage, cfg.baseSite), buildCookieString(allCookie));
+        const fullPre = await quickPrecheck(workerPage, fullUrl, fullMethod, fullPostData, fullCookieHeader, baseUrl);
+        if (sessionEpoch !== localSessionEpoch){
+            console.log(`[PM-DEBUG] Discard stale full-param probe result for ${baseUrl}; session epoch changed ${localSessionEpoch}->${sessionEpoch}`);
             return await processOne(workerPage, baseUrl);
         }
-        if (fullParamAttempt.accepted){
+        if (isLoginExpiryRedirect(baseUrl, fullPre, configLoginUrl)){
+            console.log(`[PM-DEBUG] Login expiry suspected during full-param probe for ${baseUrl}. Triggering single global re-login.`);
+            let reLoginSuccess = await reLoginAllWorkers();
+            if (reLoginSuccess) {
+                return await processOne(workerPage, baseUrl);
+            }
+        }
+        if (fullPre.skip){
+            skipCount += 1;
+            const loc = fullPre.headers && fullPre.headers.location ? fullPre.headers.location : undefined;
+            const debug = await buildProgressDebug(fullPre, fullMethod, fullUrl, fullPostData, fullCookieHeader);
+            markPmProgress(progressData, baseUrl, `pre-full-${fullPre.reason}`, fullPre.error, loc, debug);
+            fs.writeFileSync(progressFn, JSON.stringify(progressData, null, 2));
+            console.log(`[PM] skip url=${baseUrl} reason=full-${fullPre.reason} status=${fullPre.status || 0} err=${fullPre.error || ""} ms=${Date.now() - t0}`);
             return;
         }
 

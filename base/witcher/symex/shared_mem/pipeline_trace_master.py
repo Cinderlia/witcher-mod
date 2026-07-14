@@ -184,6 +184,20 @@ def _execute_analyze_job(job: Dict[str, object], logger: Optional[Logger] = None
             release_token=False,
         )
         artifact_info = _collect_analyze_artifacts(run_root=os.getcwd(), seq=int(seq))
+        try:
+            with open(os.path.join(str(artifact_info.get("logs_dir") or os.path.join(os.getcwd(), "test", "seqs", "seq_%d" % int(seq), "logs")), "parent_exit_observation.ndjson"), "a", encoding="utf-8", errors="replace") as f:
+                f.write(json.dumps({
+                    "ts": int(time.time()),
+                    "phase": "shared_mem_run_analyze_job_done",
+                    "seq": int(seq),
+                    "pid": int(os.getpid()),
+                    "ppid": int(os.getppid()),
+                    "rc": 0,
+                    "note": "run_analyze_job returned in shared_mem worker",
+                    "artifact_info": artifact_info,
+                }, ensure_ascii=False, sort_keys=True) + "\n")
+        except Exception:
+            pass
         if logger is not None:
             logger.info(
                 "analyze_job_done",
@@ -205,6 +219,20 @@ def _execute_analyze_job(job: Dict[str, object], logger: Optional[Logger] = None
         }
     except Exception as exc:
         artifact_info = _collect_analyze_artifacts(run_root=os.getcwd(), seq=int(seq))
+        try:
+            with open(os.path.join(str(artifact_info.get("logs_dir") or os.path.join(os.getcwd(), "test", "seqs", "seq_%d" % int(seq), "logs")), "parent_exit_observation.ndjson"), "a", encoding="utf-8", errors="replace") as f:
+                f.write(json.dumps({
+                    "ts": int(time.time()),
+                    "phase": "shared_mem_run_analyze_job_failed",
+                    "seq": int(seq),
+                    "pid": int(os.getpid()),
+                    "ppid": int(os.getppid()),
+                    "rc": 1,
+                    "note": str(exc),
+                    "artifact_info": artifact_info,
+                }, ensure_ascii=False, sort_keys=True) + "\n")
+        except Exception:
+            pass
         if logger is not None:
             logger.exception(
                 "analyze_job_failed",

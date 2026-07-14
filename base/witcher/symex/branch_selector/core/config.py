@@ -15,6 +15,7 @@ from typing import Any, Optional
 class BranchSelectorConfig:
     seq_start: int = 0
     seq_limit: int = 10000
+    branch_random: bool = False
     buffer_token_limit: int = 3000
     buffer_count: int = 1
     sql_buffer_token_limit: int = 3000
@@ -121,6 +122,7 @@ def load_config(config_path: Optional[str] = None) -> BranchSelectorConfig:
     return BranchSelectorConfig(
         seq_start=_get_int("seq_start", 0),
         seq_limit=_get_int("seq_limit", 10000),
+        branch_random=_get_bool("branch_random", False),
         buffer_token_limit=_get_int("buffer_token_limit", 3000),
         buffer_count=_get_int("buffer_count", 1),
         sql_buffer_token_limit=_get_int("sql_buffer_token_limit", 3000),

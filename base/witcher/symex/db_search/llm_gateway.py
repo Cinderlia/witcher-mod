@@ -461,11 +461,14 @@ def build_phase_prompt(phase: str, state: DBSearchState) -> str:
         lines.append("本轮只允许只读数据库查询。目标更偏结构，应优先使用 DESCRIBE、SHOW COLUMNS、SHOW CREATE TABLE、EXPLAIN、SELECT information_schema 来尽可能快地拿到完整表结构；只有在结构探测后仍需验证假设时，才补充普通只读 SELECT。")
         lines.append("默认策略应当是尽量用更少轮次收敛，但单轮内要更主动探索，优先争取一次拿到足够信息。")
         lines.append("本轮查询倾向是探索：尽快找出确切相关表、确切列名、确切 JOIN 路径和关键约束字段，不要停留在“是否存在某张表/有几张表”的确认层面。")
+        lines.append("本轮的任务是：**只查表结构，不查数据内容。** 本轮只回答'这个表有哪些列'，不回答'这个列里有什么数据'。")
+        lines.append("本轮禁止探寻任何业务数据的内容，包括但不限于：")
+        lines.append("- 任何业务数据的记录、值域、关联路径、失败原因等")
         lines.append("如果当前子目标提到了某个疑似列或疑似关联字段，你应主动设计探测性查询去确认它是否真实存在，而不是把它当成已知事实。")
         lines.append("优先通过 DESCRIBE / SHOW COLUMNS 获取完整列集合，再决定后续是否需要用 EXPLAIN、information_schema 或小范围 SELECT 验证关联方向。")
         lines.append("第二轮只要已经摸清总目标真正依赖的表结构，或者已经确认某个关键表/关键列存在或不存在，就可以直接 completed=true。")
-        lines.append("即使当前 schema_goal 没有逐字完成，只要现有信息已经足够服务总目标、足够支撑第三轮继续，或足够判断原目标中的某些表项是错误假设，也可以直接 completed=true。")
-        lines.append("不要为了确认低价值细节而继续追问；但如果还缺少关键表名/列名/关联关系，应在同一轮内尽量补齐。")
+        lines.append("即使当前 schema_goal 没有逐字完成，只要现有信息已经足够服务总目标，或足够判断原目标中的某些表项是错误假设，也可以直接 completed=true。")
+        lines.append("禁止确认低价值细节，禁止确认数据内容和记录，本轮只探索表结构和关联关系。")
         lines.append("如果还不够，就输出必要的查询。一轮最多输出 5 条 SQL，但应尽量一次查到足够信息。")
         lines.append("不要输出解释性文字，只输出 JSON。")
         lines.append("")
@@ -569,12 +572,12 @@ def build_phase_prompt(phase: str, state: DBSearchState) -> str:
         if fallback_allowed:
             lines.append("3. 当前仍缺少额外的结构信息，必须回退到第二轮，输出 request_schema_fallback=true 且 queries 为空")
 
-        lines.append("本轮只允许只读数据库查询，重点围绕目标查找可直接复用或验证失败原因的候选记录。")
-        lines.append("不要预设只能查某一张表，请根据已有信息选择最有帮助的查询。")
+        lines.append("本轮只允许只读数据库查询，重点围绕目标查找可直接复用或验证失败原因的候选记录。禁止使用任何业务数据上的 INSERT、UPDATE、DELETE 等语句对数据库进行修改。")
         lines.append("你的默认策略应当是尽量用更少轮次收敛，但单轮内要更主动探索，优先争取一次拿到足够信息。")
         lines.append("本轮查询倾向同样是探索：确认确切候选记录、确切约束字段、确切列名和值域来源，不要停留在模糊确认层面。")
-        lines.append("查询策略是先使用宽泛查询获取全貌，再逐步收窄，确定后续记录。")
         lines.append("在构造任何查询之前，先检查本轮已获得的结构信息（如 DESCRIBE 结果）。")
+        lines.append("优先使用不容易报错的查询语句，在获取到足够信息后，再考虑使用更复杂的查询语句。")
+        lines.append("查询策略是先使用宽泛查询获取全貌，再逐步收窄，确定后续记录。禁止在没查清楚数据分布之前，就尝试复杂的关联查询。禁止使用不确定的列名做 JOIN 操作。")
         lines.append("只使用已确认存在的表名和列名，如果某列在结构信息中未出现，不要假设它存在。")
         lines.append("如果查询返回字段不存在的报错，后续查询不再使用该列，如果一条查询路径因结构不匹配而失败，切换到其他可用路径。")
         lines.append("不要在同一路径上反复尝试不同写法——结构错误不会因写法改变而消失。")
@@ -667,8 +670,17 @@ def build_phase_prompt(phase: str, state: DBSearchState) -> str:
             lines.append("如果现有信息已经足以构造高置信度 solution，就直接输出最终结果，不要为了补齐低价值细节继续查询。")
             lines.append("只有在缺少会直接影响 solution 构造的关键信息时，才进行补查。")
         lines.append("")
+        branch_truth = _extract_branch_truth_from_code_slice(ctx.code_slice, ctx.target_seq)
+        target_truth = ""
+        if branch_truth == "true":
+            target_truth = "false"
+        elif branch_truth == "false":
+            target_truth = "true"
         lines.append("总目标：")
-        lines.append("如果第" + (str(ctx.target_seq) if ctx.target_seq is not None else "?") + "行前面标注为[true]，表示当前实际执行到了true分支，你的目标是让它改走false分支；如果标注为[false]，则目标是让它改走true分支。")
+        if target_truth:
+            lines.append("总目标是让第" + (str(ctx.target_seq) if ctx.target_seq is not None else "?") + "行的 if 语句取" + target_truth + "。")
+        else:
+            lines.append("总目标是让第" + (str(ctx.target_seq) if ctx.target_seq is not None else "?") + "行的 if 语句反转。")
         lines.append("")
         if state.goal.finalize_stop_conditions:
             lines.append("第四轮可直接输出条件：")
@@ -690,8 +702,9 @@ def build_phase_prompt(phase: str, state: DBSearchState) -> str:
         lines.append("")
         lines.append("可选项：")
         lines.append("1. 直接输出最终结果，并在 solutions 中给出最终解")
+        lines.append("2. 必须使用被禁止的SQL语句才能反转目标分支，放弃输出 solution")
         if query_allowed:
-            lines.append("2. 补查数据库，输出 queries")
+            lines.append("3. 补查数据库，输出 queries")
         lines.append("请根据需求修改PHP请求的环境变量、POST、COOKIE、GET、SESSION参数（对应 JSON 字段：ENV/POST/COOKIE/GET/SESSION）。只输出需要修改的键和值，不要把未修改的部分原样抄回 JSON。下游会基于当前输入做增量合并。")
         lines.append("如果某个 solution 只需要修改数据库，就只输出 SQL，不要输出 SESSION/ENV/GET/POST/COOKIE。")
         lines.append("如果某个 solution 只需要修改外部输入，就只输出对应的输入键，不要补写未修改的键。")
@@ -699,11 +712,17 @@ def build_phase_prompt(phase: str, state: DBSearchState) -> str:
         lines.append("SQL 可以是字符串，也可以是字符串数组。")
         lines.append("如果只需要修改数据库，不需要修改外部输入，也仍然要输出一个 solution 对象；这个对象可以只有 SQL 字段。")
         lines.append("如果既要改输入又要改数据库，就在同一个 solution 对象里同时放输入修改和 SQL。")
-        lines.append("")
+        lines.append("如果某个 solution 的 SQL 会修改数据库，可以额外输出 undo_sql 字段，表示对应的抵消语句，用于后续恢复数据库。undo_sql 可以为空、字符串或字符串数组。")
+        lines.append("不要为了构造 undo_sql 进行额外数据库查询；只有在不增加任何额外查询的前提下能直接给出时才输出。")
+        lines.append("允许使用普通业务数据上的 INSERT、UPDATE、DELETE 等语句对数据库进行修改。")
         lines.append("输出 SQL 时，不需要关心数据库用户、数据库地址和数据库名，直接输出可执行的合法 SQL 语句即可。")
+        lines.append("严禁输出任何高危数据库语句，以下语句无论出现在开头还是中间都禁止：DROP、ALTER、REVOKE、TRUNCATE、GRANT、SET GLOBAL、KILL。")
+        lines.append("严禁输出任何会影响数据库用户或权限的语句，例如：UPDATE mysql.user、DELETE FROM mysql.user、INSERT INTO mysql.user、REPLACE INTO mysql.user、CREATE USER、ALTER USER、DROP USER、RENAME USER、SET PASSWORD、GRANT ALL PRIVILEGES。")
+        lines.append("如果你认为只能通过上述高危语句才能达成目标，也不能输出它们，允许放弃输出 solution 对象。")
         lines.append("请输出如下 JSON：")
         lines.append("{")
-        lines.append('  "rationale": "本轮为何补查或为何能直接输出",')
+        lines.append('  "abandon": false,')
+        lines.append('  "rationale": "本轮为何补查、为何能直接输出，或为何放弃",')
         lines.append('  "findings": ["与最终求解直接相关的结论"],')
         if query_allowed:
             lines.append('  "queries": [')
@@ -716,14 +735,42 @@ def build_phase_prompt(phase: str, state: DBSearchState) -> str:
         lines.append('  "solutions": [')
         lines.append("    {")
         lines.append('      "POST": {"username": "admin"},')
-        lines.append('      "SQL": ["UPDATE users SET role=\'admin\' WHERE id=1;"]')
+        lines.append('      "SQL": ["UPDATE users SET role=\'admin\' WHERE id=1;"],')
+        lines.append('      "undo_sql": ["UPDATE users SET role=\'user\' WHERE id=1;"]')
         lines.append("    }")
         lines.append("  ]")
+        lines.append("}")
+        lines.append("放弃输出示例：")
+        lines.append("{")
+        lines.append('  "abandon": true,')
+        lines.append('  "rationale": "若想反转该分支，只能依赖被禁止的高危 SQL，故放弃第四轮输出",')
+        lines.append('  "findings": ["当前可行方案都需要高危数据库语句"],')
+        if query_allowed:
+            lines.append('  "queries": [],')
+        lines.append('  "solutions": []')
         lines.append("}")
         if query_allowed:
             lines.append("如果还需要补查，则输出 queries；此时不要输出 solutions。")
             lines.append("如果已经可以直接输出，则不要输出 queries，并输出至少一个 solution。")
+        lines.append("如果决定放弃，则设置 abandon=true，并且不要输出 queries、solutions、db_actions。")
         return "\n".join(lines).rstrip() + "\n"
+    return ""
+
+
+def _extract_branch_truth_from_code_slice(code_slice: str, target_seq: Optional[int]) -> str:
+    if target_seq is None:
+        return ""
+    seq_text = str(int(target_seq))
+    for raw_line in str(code_slice or "").splitlines():
+        line = str(raw_line or "")
+        if not line:
+            continue
+        if not re.match(r"\s*" + re.escape(seq_text) + r"\|", line):
+            continue
+        truth_match = re.match(r"\s*" + re.escape(seq_text) + r"\|\s*\[(true|false)\]", line, re.IGNORECASE)
+        if truth_match:
+            return str(truth_match.group(1) or "").lower()
+        break
     return ""
 
 
@@ -819,14 +866,40 @@ def parse_phase_outcome(response_text: str, *, phase: Optional[str] = None) -> P
                 output_solutions.append(dict(item))
     elif isinstance(obj.get("solution"), dict):
         output_solutions.append(dict(obj.get("solution")))
+    undo_sqls = []
+    for solution in output_solutions:
+        if not isinstance(solution, dict):
+            continue
+        raw_undo = solution.get("undo_sql")
+        normalized = []
+        if isinstance(raw_undo, str):
+            if raw_undo.strip():
+                normalized.append(raw_undo.strip())
+        elif isinstance(raw_undo, (list, tuple)):
+            for item in raw_undo:
+                if isinstance(item, str) and item.strip():
+                    normalized.append(item.strip())
+        if normalized:
+            solution["undo_sql"] = list(normalized)
+            undo_sqls.extend(normalized)
+        elif "undo_sql" in solution:
+            solution["undo_sql"] = []
+    abandon = bool(obj.get("abandon"))
+    if abandon:
+        query_plans = []
+        output_solutions = []
+        db_actions = []
+        undo_sqls = []
     return PhaseOutcome(
         phase=out_phase,
         completed=completed,
         request_schema_fallback=bool(obj.get("request_schema_fallback")),
+        abandon=abandon,
         rationale=str(obj.get("rationale") or "").strip(),
         findings=[str(x).strip() for x in (obj.get("findings") or []) if str(x).strip()],
         query_plans=query_plans,
         output_solutions=output_solutions,
-        output_patch=obj.get("output_patch") if isinstance(obj.get("output_patch"), dict) else {},
+        output_patch=({} if abandon else (obj.get("output_patch") if isinstance(obj.get("output_patch"), dict) else {})),
         db_actions=db_actions,
+        undo_sqls=undo_sqls,
     )

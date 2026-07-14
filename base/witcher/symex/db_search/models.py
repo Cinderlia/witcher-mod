@@ -109,12 +109,14 @@ class PhaseOutcome:
     phase: str = ""
     completed: bool = False
     request_schema_fallback: bool = False
+    abandon: bool = False
     rationale: str = ""
     findings: List[str] = field(default_factory=list)
     query_plans: List[DBQueryPlan] = field(default_factory=list)
     output_solutions: List[Dict[str, Any]] = field(default_factory=list)
     output_patch: Dict[str, Any] = field(default_factory=dict)
     db_actions: List[DBQueryPlan] = field(default_factory=list)
+    undo_sqls: List[str] = field(default_factory=list)
 
 
 @dataclass

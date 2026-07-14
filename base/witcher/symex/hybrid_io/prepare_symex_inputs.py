@@ -159,6 +159,7 @@ def write_command_files(
         "method_map",
         "SCRIPT_FILENAME",
         "SCRIPT_NAME",
+        "REQUEST_URI",
         "METHOD",
         "PATH_INFO",
         "REQUEST_METHOD",
@@ -168,6 +169,7 @@ def write_command_files(
         "WC_INSTRUMENTATION",
         "NO_WC_EXTRA",
         "STRICT",
+        "HTTP_HOST",
         "SERVER_NAME",
         "DO_JSON",
         "WITCHER_PRINT_OP",
@@ -207,6 +209,8 @@ def write_command_files(
                 val = auth_snapshot.get(key, "")
             if (not val) and key == "REQUEST_METHOD":
                 val = method_v
+            if (not val) and key == "REQUEST_URI":
+                val = str(env.get("SCRIPT_NAME", "") or env.get("SCRIPT_FILENAME", "") or "")
             wf.write(f'export {key}="{val}"\n')
         wf.write(f'export WC_TRACE_INPUT_DIR="{str(trace_input_dir or "")}"\n')
         wf.write(f'export WC_TRACE_SESSION_CAPTURE_FILENAME="{str(trace_session_capture_filename or "")}"\n')
@@ -228,9 +232,25 @@ def write_command_files(
         wf.write('  echo "METHOD=$METHOD"\n')
         wf.write('  echo "SCRIPT_NAME=$SCRIPT_NAME"\n')
         wf.write('  echo "SCRIPT_FILENAME=$SCRIPT_FILENAME"\n')
+        wf.write('  echo "REQUEST_URI=${REQUEST_URI:-}"\n')
+        wf.write('  echo "CONTENT_TYPE=${CONTENT_TYPE:-}"\n')
+        wf.write('  echo "CONTENT_LENGTH=${CONTENT_LENGTH:-}"\n')
+        wf.write('  echo "QUERY_STRING=${QUERY_STRING:-}"\n')
+        wf.write('  echo "LD_PRELOAD=${LD_PRELOAD:-}"\n')
+        wf.write('  echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}"\n')
+        wf.write('  echo "STRICT=${STRICT:-}"\n')
+        wf.write('  echo "WC_INSTRUMENTATION=${WC_INSTRUMENTATION:-}"\n')
+        wf.write('  echo "NO_WC_EXTRA=${NO_WC_EXTRA:-}"\n')
+        wf.write('  echo "AFL_PRELOAD=${AFL_PRELOAD:-}"\n')
+        wf.write('  echo "DO_JSON=${DO_JSON:-}"\n')
+        wf.write('  echo "WITCHER_PRINT_OP=${WITCHER_PRINT_OP:-}"\n')
+        wf.write('  echo "REDIRECT_STATUS=${REDIRECT_STATUS:-}"\n')
+        wf.write('  echo "HTTP_REDIRECT_STATUS=${HTTP_REDIRECT_STATUS:-}"\n')
         wf.write('  echo "method_map=$method_map"\n')
         wf.write('  echo "LOGIN_COOKIE=${LOGIN_COOKIE:-}"\n')
         wf.write('  echo "MANDATORY_COOKIE=${MANDATORY_COOKIE:-}"\n')
+        wf.write('  echo "HTTP_HOST=${HTTP_HOST:-}"\n')
+        wf.write('  echo "SERVER_NAME=${SERVER_NAME:-}"\n')
         wf.write('  echo "REQUEST_METHOD=${REQUEST_METHOD:-}"\n')
         wf.write('  echo "PATH_INFO=${PATH_INFO:-}"\n')
         wf.write('  echo "WC_TRACE_INPUT_DIR=${WC_TRACE_INPUT_DIR:-}"\n')
@@ -324,6 +344,8 @@ def prepare_inputs(config: str, work_dir: str, request_data: str = "") -> dict:
             "MANDATORY_COOKIE": (env.get("MANDATORY_COOKIE", "") or auth_snapshot.get("MANDATORY_COOKIE", "")),
             "AUTHORIZATION": (env.get("AUTHORIZATION", "") or auth_snapshot.get("AUTHORIZATION", "")),
             "HTTP_AUTHORIZATION": (env.get("HTTP_AUTHORIZATION", "") or auth_snapshot.get("HTTP_AUTHORIZATION", "")),
+            "HTTP_HOST": (env.get("HTTP_HOST", "") or auth_snapshot.get("HTTP_HOST", "")),
+            "SERVER_NAME": (env.get("SERVER_NAME", "") or auth_snapshot.get("SERVER_NAME", "")),
         },
         "trace_session_capture_filename": trace_session_capture_filename,
         "trace_session_capture_tmp_path": str(Path("/tmp") / "wc_session_trace" / trace_session_capture_filename),

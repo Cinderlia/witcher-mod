@@ -8,6 +8,7 @@ if os.path.isdir("/xss_reflection") and "/" not in sys.path:
     sys.path.insert(0, "/")
 from xss_reflection.wrapper import run_xss_flow
 from .symex_launcher import start_symex_hybrid, stop_symex
+from .db_manager import DBBackupManager
 from urllib.parse import urlparse, urlunparse, unquote, parse_qsl, urlencode, urljoin
 import urllib.request
 import http.cookiejar
@@ -79,6 +80,7 @@ class Witcher():
 
         self.request_data_fn = os.path.join(self.testloc,"request_data.json")
         self.request_data = json.load(open(self.request_data_fn,"r", encoding='latin-1'))
+        self.merge_seed_requests = self._seed_request_merge_enabled()
         self._merge_seed_requests_into_main()
         self._seed_login_cookie_blacklist = set()
 
@@ -109,6 +111,7 @@ class Witcher():
         self.saved_seeds = set()
         self._pending_seed_processing_logs = []
         self.symex_handle = None
+        self.db_backup_manager = None
         self.coverage_daemon_proc = None
         self.coverage_daemon_log_fp = None
         # Global wall-clock timer for global_timeout accounting across retries/reallocations.
@@ -123,6 +126,11 @@ class Witcher():
         self.url_filter = args.url_filter
 
 
+    def _seed_request_merge_enabled(self):
+        if not isinstance(self.jconfig, dict):
+            return False
+        return bool(self.jconfig.get("merge_seed_requests", False))
+
     def _merge_seed_requests_into_main(self):
         if not isinstance(self.request_data, dict):
             self.request_data = {"requestsFound": {}}
@@ -131,6 +139,8 @@ class Witcher():
         if not isinstance(main_reqs, dict):
             main_reqs = {}
             self.request_data["requestsFound"] = main_reqs
+        if not self.merge_seed_requests:
+            return
         seed_reqs = self.request_data.get("seedRequestsFound")
         if not isinstance(seed_reqs, dict) or len(seed_reqs) == 0:
             return
@@ -2388,12 +2398,18 @@ class Witcher():
                 )
         # ----------------------------------------
 
+        def _pre_afl_instance_start(instance_cnt):
+            if self.db_backup_manager is not None:
+                self.db_backup_manager.restore_from_backup()
+
         fuzzer = Phuzzer.phactory(phuzzer_type=Phuzzer.WITCHER_AFL, target=self.fuzzer_target_binary, target_opts=binary_options,
                                   work_dir=self.work_dir, seeds=seeds, afl_count=self.cores,
                                   create_dictionary=False, timeout=dynamic_timeout, memory=self.memory,
                                   run_timeout=self.run_timeout, dictionary=dictionary_str,
                                   use_qemu=self.use_qemu, resume=do_resume, login_json_fn=self.config_loc,
-                                  base_port=self.server_base_port, container_info=self.container_info, fault_escalation=not self.no_fault_escalation)
+                                  base_port=self.server_base_port, container_info=self.container_info,
+                                  fault_escalation=not self.no_fault_escalation,
+                                  pre_instance_callback=_pre_afl_instance_start)
         self._flush_seed_processing_logs()
 
         def chown_files():
@@ -2412,6 +2428,21 @@ class Witcher():
 
         # Coverage daemon entry disabled (keep implementation for later restore).
         # self._start_coverage_daemon()
+        db_backup_enabled = bool(self.jconfig.get("witcher_db_backup_enabled", True))
+        try:
+            self.db_backup_manager = DBBackupManager(
+                config_path=self.config_loc,
+                work_dir=self.work_dir,
+                enabled=db_backup_enabled,
+            )
+        except Exception as ex:
+            self.db_backup_manager = None
+            try:
+                os.makedirs(self.work_dir, exist_ok=True)
+                with open(os.path.join(self.work_dir, "db_backup.log"), "a", encoding="utf-8", errors="replace") as wf:
+                    wf.write("[%s] [ERROR] 初始化数据库备份管理失败，已跳过数据库备份/恢复: %s\n" % (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), str(ex)))
+            except Exception:
+                pass
         fuzzer.start()
         self.symex_handle = start_symex_hybrid(
             work_dir=self.work_dir,
@@ -2580,9 +2611,17 @@ class Witcher():
             end_reason = "Keyboard Interrupt"
             print("\n[*] Aborting wait. Ctrl-C again for KeyboardInterrupt.")
             self.kill = True
+            if self.db_backup_manager is not None:
+                try:
+                    self.db_backup_manager.cleanup_on_interrupt()
+                except Exception:
+                    pass
 
         except Exception as e:
             import traceback
+            os.makedirs(self.work_dir, exist_ok=True)
+            with open(os.path.join(self.work_dir, "witcher_error.log"), "a", encoding="utf-8", errors="replace") as err_fp:
+                traceback.print_exc(file=err_fp)
             traceback.print_exc()
             end_reason = "Exception occurred"
             print("\n[*] Unknown exception received (%s). Terminating fuzzer." % e)
@@ -2619,6 +2658,9 @@ class Witcher():
             self.symex_handle = None
             reporter.stop()
             fuzzer.stop()
+            if self.db_backup_manager is not None:
+                self.db_backup_manager.cleanup_backup()
+                self.db_backup_manager = None
             if self.kill:
                 exit(199)
         return start_results

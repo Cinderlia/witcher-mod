@@ -19,6 +19,7 @@
   "branch_selector": {
     "seq_start": 0,
     "seq_limit": 20000,
+    "branch_random": false,
     "buffer_token_limit": 3000,
     "buffer_count": 3,
     "sql_buffer_token_limit": 3000,

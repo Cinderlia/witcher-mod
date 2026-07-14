@@ -7,6 +7,7 @@ import asyncio
 import contextlib
 import json
 import os
+import random
 import signal
 import sys
 import shutil
@@ -383,6 +384,8 @@ def _collect_analyze_artifacts(*, run_root: str, seq: int) -> Dict[str, object]:
     logs_dir = os.path.join(seq_root, "logs")
     heartbeat_status_path = os.path.join(logs_dir, "heartbeat.status.json")
     analysis_output_path = os.path.join(seq_root, "analysis_output_%d.json" % int(seq))
+    exit_record_path = os.path.join(logs_dir, "exit_record.ndjson")
+    exit_debug_path = os.path.join(logs_dir, "exit_debug.ndjson")
     payload: Dict[str, object] = {
         "seq_root": seq_root,
         "seq_root_exists": bool(os.path.isdir(seq_root)),
@@ -392,6 +395,10 @@ def _collect_analyze_artifacts(*, run_root: str, seq: int) -> Dict[str, object]:
         "heartbeat_status_exists": bool(os.path.exists(heartbeat_status_path)),
         "analysis_output_path": analysis_output_path,
         "analysis_output_exists": bool(os.path.exists(analysis_output_path)),
+        "exit_record_path": exit_record_path,
+        "exit_record_exists": bool(os.path.exists(exit_record_path)),
+        "exit_debug_path": exit_debug_path,
+        "exit_debug_exists": bool(os.path.exists(exit_debug_path)),
     }
     if os.path.exists(heartbeat_status_path):
         try:
@@ -406,6 +413,16 @@ def _collect_analyze_artifacts(*, run_root: str, seq: int) -> Dict[str, object]:
             pass
         try:
             payload["heartbeat_mtime"] = float(os.path.getmtime(heartbeat_status_path))
+        except Exception:
+            pass
+    if os.path.exists(exit_record_path):
+        try:
+            payload["exit_record_mtime"] = float(os.path.getmtime(exit_record_path))
+        except Exception:
+            pass
+    if os.path.exists(exit_debug_path):
+        try:
+            payload["exit_debug_mtime"] = float(os.path.getmtime(exit_debug_path))
         except Exception:
             pass
     return payload
@@ -564,8 +581,73 @@ def _write_parent_exit_observation(
     artifact_info: Optional[Dict[str, object]] = None,
     note: str = "",
     inference: Optional[Dict[str, object]] = None,
+    child_pid: Optional[int] = None,
+    child_alive: Optional[bool] = None,
+    child_status: str = "",
 ) -> None:
-    return
+    seq_root = os.path.join(os.path.abspath(run_root), "test", "seqs", "seq_%d" % int(seq))
+    logs_dir = os.path.join(seq_root, "logs")
+    path = os.path.join(logs_dir, "parent_exit_observation.ndjson")
+    try:
+        os.makedirs(logs_dir, exist_ok=True)
+    except Exception:
+        pass
+    payload: Dict[str, object] = {
+        "ts": int(time.time()),
+        "phase": str(phase or ""),
+        "seq": int(seq),
+        "pid": int(os.getpid()),
+        "ppid": int(os.getppid()),
+        "rc": (int(rc) if rc is not None else None),
+        "signal_name": _signal_name_from_return_code(rc),
+        "note": str(note or ""),
+        "artifact_info": (artifact_info if isinstance(artifact_info, dict) else {}),
+        "inference": (inference if isinstance(inference, dict) else {}),
+        "child_pid": (int(child_pid) if child_pid is not None else None),
+        "child_alive": child_alive,
+        "child_status": str(child_status or ""),
+    }
+    try:
+        with open(path, "a", encoding="utf-8", errors="replace") as f:
+            f.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+    except Exception:
+        return
+
+
+async def _monitor_analyze_process(*, run_root: str, seq: int, proc, poll_sec: float = 0.5) -> None:
+    child_pid = None
+    try:
+        child_pid = int(getattr(proc, "pid", 0) or 0)
+    except Exception:
+        child_pid = None
+    if not child_pid:
+        return
+    last_alive = None
+    while True:
+        rc = proc.returncode
+        if rc is None:
+            try:
+                rc = proc.returncode if proc.returncode is not None else proc._transport.get_returncode()  # type: ignore[attr-defined]
+            except Exception:
+                rc = None
+        alive = (rc is None)
+        if last_alive is None or bool(alive) != bool(last_alive):
+            _write_parent_exit_observation(
+                run_root=run_root,
+                seq=int(seq),
+                phase=("process_monitor_alive" if alive else "process_monitor_exit"),
+                rc=(int(rc) if rc is not None else None),
+                artifact_info=_collect_analyze_artifacts(run_root=run_root, seq=int(seq)),
+                note=("monitor sampled child process state"),
+                inference=_probe_analyze_liveness(run_root=run_root, seq=int(seq), stale_after_sec=25.0),
+                child_pid=int(child_pid),
+                child_alive=bool(alive),
+                child_status=("alive" if alive else "exited"),
+            )
+            last_alive = bool(alive)
+        if rc is not None:
+            break
+        await asyncio.sleep(max(0.1, float(poll_sec)))
 
 
 async def _wait_for_analyze_startup(*, run_root: str, seq: int, proc, timeout_sec: float = 3.0) -> Tuple[bool, Dict[str, object], Optional[int]]:
@@ -1144,6 +1226,26 @@ async def _run_analyze_seq(
                     stdout_path=os.path.join(meta_dir, "analyze_%d.out" % int(seq)),
                     stderr_path=os.path.join(meta_dir, "analyze_%d.err" % int(seq)),
                 )
+            _write_parent_exit_observation(
+                run_root=os.getcwd(),
+                seq=int(seq),
+                phase="process_spawned",
+                rc=None,
+                artifact_info=_collect_analyze_artifacts(run_root=os.getcwd(), seq=int(seq)),
+                note="legacy analyze subprocess spawned",
+                inference=_probe_analyze_liveness(run_root=os.getcwd(), seq=int(seq), stale_after_sec=25.0),
+                child_pid=int(proc.pid),
+                child_alive=True,
+                child_status="spawned",
+            )
+            _track_task(
+                _PENDING_TASKS,
+                asyncio.create_task(_monitor_analyze_process(run_root=os.getcwd(), seq=int(seq), proc=proc, poll_sec=0.5)),
+                logger=logger,
+                event="analyze_process_monitor_started",
+                seq=int(seq),
+                pid=int(proc.pid),
+            )
             startup_ok, artifact_info, early_rc = await _wait_for_analyze_startup(run_root=os.getcwd(), seq=int(seq), proc=proc, timeout_sec=3.0)
             if logger is not None:
                 if startup_ok:
@@ -1178,6 +1280,19 @@ async def _run_analyze_seq(
                         inference=_probe_analyze_liveness(run_root=os.getcwd(), seq=int(seq), stale_after_sec=25.0),
                     )
             rc = await proc.wait()
+            artifact_info = _collect_analyze_artifacts(run_root=os.getcwd(), seq=int(seq))
+            _write_parent_exit_observation(
+                run_root=os.getcwd(),
+                seq=int(seq),
+                phase="process_wait_completed",
+                rc=int(rc),
+                artifact_info=artifact_info,
+                note=("legacy analyze subprocess wait completed"),
+                inference=_probe_analyze_liveness(run_root=os.getcwd(), seq=int(seq), stale_after_sec=25.0),
+                child_pid=int(proc.pid),
+                child_alive=False,
+                child_status="wait_completed",
+            )
             if logger is not None:
                 if int(rc) == 0:
                     artifact_info = _collect_analyze_artifacts(run_root=os.getcwd(), seq=int(seq))
@@ -1276,6 +1391,72 @@ async def _await_task_set(task_set: set, *, logger: Optional[Logger] = None, tas
         raise first_error
 
 
+def _select_random_if_seqs(
+    prompt_seqs: List[int],
+    llm_selected_seqs: List[int],
+) -> List[int]:
+    prompt_unique = []
+    prompt_seen = set()
+    for seq in prompt_seqs or []:
+        try:
+            seq_i = int(seq)
+        except Exception:
+            continue
+        if seq_i in prompt_seen:
+            continue
+        prompt_seen.add(seq_i)
+        prompt_unique.append(seq_i)
+    selected_unique = []
+    selected_seen = set()
+    for seq in llm_selected_seqs or []:
+        try:
+            seq_i = int(seq)
+        except Exception:
+            continue
+        if seq_i in selected_seen:
+            continue
+        selected_seen.add(seq_i)
+        selected_unique.append(seq_i)
+    sample_count = min(len(prompt_unique), len(selected_unique))
+    if sample_count <= 0:
+        return []
+    randomized = random.sample(prompt_unique, sample_count)
+    return [int(x) for x in randomized]
+
+
+def _write_branch_random_log(
+    response_path: str,
+    *,
+    prompt_seqs: List[int],
+    llm_selected_seqs: List[int],
+    randomized_seqs: List[int],
+    logger: Optional[Logger] = None,
+) -> str:
+    response_abs_path = os.path.abspath(response_path)
+    response_dir = os.path.dirname(response_abs_path)
+    response_name = os.path.basename(response_abs_path)
+    stem, _ = os.path.splitext(response_name)
+    log_path = os.path.join(response_dir, stem + ".branch_random.json")
+    payload = {
+        "response_path": response_abs_path,
+        "prompt_seq_count": int(len(prompt_seqs or [])),
+        "llm_seq_count": int(len(llm_selected_seqs or [])),
+        "llm_selected_seqs": [int(x) for x in (llm_selected_seqs or [])],
+        "random_selected_seq_count": int(len(randomized_seqs or [])),
+        "random_selected_seqs": [int(x) for x in (randomized_seqs or [])],
+    }
+    with open(log_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    if logger is not None:
+        logger.info(
+            "branch_random_log_written",
+            path=log_path,
+            llm_seq_count=int(len(llm_selected_seqs or [])),
+            random_selected_seq_count=int(len(randomized_seqs or [])),
+        )
+    return log_path
+
+
 async def _handle_llm_response(
     seqs_groups: List[List[int]],
     *,
@@ -1362,6 +1543,7 @@ async def _flush_buffer(
     sql_mode: bool,
     xss_mode: bool,
     cmd_mode: bool,
+    branch_random: bool,
     prompt_out_dir: str,
     response_out_dir: str,
     llm_client,
@@ -1534,8 +1716,20 @@ async def _flush_buffer(
                 "seq_count": int(seq_count),
             },
         )
+        llm_groups_for_handle = resp_groups_norm
+        if branch_random:
+            llm_selected_seqs = [x for g in resp_groups_norm for x in (g or [])]
+            random_seqs = _select_random_if_seqs(prompt_marked_seqs, llm_selected_seqs)
+            _write_branch_random_log(
+                str(rpath or ""),
+                prompt_seqs=prompt_marked_seqs,
+                llm_selected_seqs=llm_selected_seqs,
+                randomized_seqs=random_seqs,
+                logger=logger,
+            )
+            llm_groups_for_handle = [random_seqs] if random_seqs else []
         await _handle_llm_response(
-            resp_groups_norm,
+            llm_groups_for_handle,
             llm_test_mode=analyze_llm_test_mode,
             sql_mode=sql_mode,
             xss_mode=xss_mode,
@@ -1583,8 +1777,20 @@ async def _flush_buffer(
                     "seq_count": int(seq_count),
                 },
             )
+            llm_groups_for_handle = resp_groups_norm
+            if branch_random:
+                llm_selected_seqs = [x for g in resp_groups_norm for x in (g or [])]
+                random_seqs = _select_random_if_seqs(prompt_marked_seqs, llm_selected_seqs)
+                _write_branch_random_log(
+                    str(rpath or ""),
+                    prompt_seqs=prompt_marked_seqs,
+                    llm_selected_seqs=llm_selected_seqs,
+                    randomized_seqs=random_seqs,
+                    logger=logger,
+                )
+                llm_groups_for_handle = [random_seqs] if random_seqs else []
             await _handle_llm_response(
-                resp_groups_norm,
+                llm_groups_for_handle,
                 llm_test_mode=analyze_llm_test_mode,
                 sql_mode=sql_mode,
                 xss_mode=xss_mode,
@@ -1688,8 +1894,20 @@ async def _flush_buffer(
             "response_chars": int(len(txt or "")),
         },
     )
+    llm_groups_for_handle = resp_groups_norm
+    if branch_random:
+        llm_selected_seqs = [x for g in resp_groups_norm for x in (g or [])]
+        random_seqs = _select_random_if_seqs(prompt_marked_seqs, llm_selected_seqs)
+        _write_branch_random_log(
+            str(rpath or ""),
+            prompt_seqs=prompt_marked_seqs,
+            llm_selected_seqs=llm_selected_seqs,
+            randomized_seqs=random_seqs,
+            logger=logger,
+        )
+        llm_groups_for_handle = [random_seqs] if random_seqs else []
     await _handle_llm_response(
-        resp_groups_norm,
+        llm_groups_for_handle,
         llm_test_mode=analyze_llm_test_mode,
         sql_mode=sql_mode,
         xss_mode=xss_mode,
@@ -2123,6 +2341,7 @@ async def run_pipeline(
             sql_mode=False,
             xss_mode=False,
             cmd_mode=False,
+            branch_random=cfg.branch_random,
             prompt_out_dir=prompt_out_dir,
             response_out_dir=response_out_dir,
             llm_client=llm_client,
@@ -2166,6 +2385,7 @@ async def run_pipeline(
             sql_mode=True,
             xss_mode=False,
             cmd_mode=False,
+            branch_random=cfg.branch_random,
             prompt_out_dir=prompt_out_dir,
             response_out_dir=response_out_dir,
             llm_client=llm_client,
@@ -2209,6 +2429,7 @@ async def run_pipeline(
             sql_mode=False,
             xss_mode=True,
             cmd_mode=False,
+            branch_random=cfg.branch_random,
             prompt_out_dir=prompt_out_dir,
             response_out_dir=response_out_dir,
             llm_client=llm_client,
@@ -2252,6 +2473,7 @@ async def run_pipeline(
             sql_mode=False,
             xss_mode=False,
             cmd_mode=True,
+            branch_random=cfg.branch_random,
             prompt_out_dir=prompt_out_dir,
             response_out_dir=response_out_dir,
             llm_client=llm_client,

@@ -307,7 +307,7 @@ def _start_request_crawler(base_url: str, base_appdir: str, crawler_cfg: dict) -
         if use_xvfb:
             cmd.extend(["xvfb-run", "-a"])
 
-        cmd.extend([node_bin, str(crawler_js)])
+        cmd.extend([node_bin, str(crawler_js.parent / "main.js")])
         if mode_arg:
             cmd.append(mode_arg)
         cmd.extend([base_url, base_appdir])
@@ -520,6 +520,7 @@ def _run_param_minimizer(base_url: str, base_appdir: str, cfg: dict, crawler_cfg
         timeout_value = str(crawler_cfg.get("timeout") or "").strip()
 
     script_js = (Path(__file__).resolve().parent.parent / "request_crawler" / "param_minimizer.js").resolve()
+    script_entry = str(script_js.parent / "param_minimizer.js")
     cmd = []
     if timeout_value:
         kill_after = "30s"
@@ -528,7 +529,7 @@ def _run_param_minimizer(base_url: str, base_appdir: str, cfg: dict, crawler_cfg
         cmd.extend(["timeout", "-k", kill_after, timeout_value])
     if use_xvfb:
         cmd.extend(["xvfb-run", "-a"])
-    cmd.extend([node_bin, str(script_js)])
+    cmd.extend([node_bin, script_entry])
     if mode_arg:
         cmd.append(mode_arg)
     cmd.extend([base_url, base_appdir, urls_path, params_path])

@@ -723,6 +723,25 @@ class HybridDaemonScheduler:
             meta={"seq": int(seq), "mode": mode},
         )
         self._log("analyze_start seq=%d mode=%s seed_hash=%s pid=%s" % (int(seq), mode, (parent.seed_hash or "")[:8], str(p.pid)))
+        try:
+            logs_dir = os.path.join(parent.run_dir, "test", "seqs", "seq_%d" % int(seq), "logs")
+            os.makedirs(logs_dir, exist_ok=True)
+            with open(os.path.join(logs_dir, "parent_exit_observation.ndjson"), "a", encoding="utf-8", errors="replace") as f:
+                f.write(json.dumps({
+                    "ts": int(time.time()),
+                    "phase": "daemon_scheduler_analyze_spawned",
+                    "seq": int(seq),
+                    "pid": int(os.getpid()),
+                    "ppid": int(os.getppid()),
+                    "rc": None,
+                    "child_pid": int(p.pid),
+                    "child_alive": True,
+                    "child_status": "spawned",
+                    "note": "daemon scheduler spawned analyze",
+                    "seed_hash": str((parent.seed_hash or "")[:8]),
+                }, ensure_ascii=False, sort_keys=True) + "\n")
+        except Exception:
+            pass
         return info
 
     def _poll_finished(self, procs: List[_ProcInfo]) -> Tuple[List[_ProcInfo], List[_ProcInfo]]:
@@ -911,6 +930,25 @@ class HybridDaemonScheduler:
         for a in done_an:
             rc = a.popen.returncode
             self._log("analyze_done rc=%s seq=%s seed_hash=%s" % (str(rc), str(a.meta.get("seq")), (a.seed_hash or "")[:8]))
+            try:
+                logs_dir = os.path.join(a.run_dir, "test", "seqs", "seq_%d" % int(a.meta.get("seq") or 0), "logs")
+                os.makedirs(logs_dir, exist_ok=True)
+                with open(os.path.join(logs_dir, "parent_exit_observation.ndjson"), "a", encoding="utf-8", errors="replace") as f:
+                    f.write(json.dumps({
+                        "ts": int(time.time()),
+                        "phase": "daemon_scheduler_analyze_done",
+                        "seq": int(a.meta.get("seq") or 0),
+                        "pid": int(os.getpid()),
+                        "ppid": int(os.getppid()),
+                        "rc": (int(rc) if rc is not None else None),
+                        "child_pid": int(getattr(a.popen, "pid", 0) or 0),
+                        "child_alive": False,
+                        "child_status": "poll_finished",
+                        "note": "daemon scheduler observed analyze completion",
+                        "seed_hash": str((a.seed_hash or "")[:8]),
+                    }, ensure_ascii=False, sort_keys=True) + "\n")
+            except Exception:
+                pass
 
         while self._pending_analyze and len(self._running_analyze) < int(self.max_analyze_procs):
             parent, seq, mode = self._pending_analyze.pop(0)

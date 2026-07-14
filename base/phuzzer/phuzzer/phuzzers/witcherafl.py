@@ -33,7 +33,8 @@ class WitcherAFL(AFL):
         crash_mode=False, use_qemu=True,
         run_timeout=None, login_json_fn="",
         server_cmd=None, server_env_vars=None,
-        base_port=None, container_info=None, fault_escalation=True
+        base_port=None, container_info=None, fault_escalation=True,
+        pre_instance_callback=None,
     ):
         """
         :param target: path to the script to fuzz (from AFL)
@@ -93,6 +94,7 @@ class WitcherAFL(AFL):
         self.server_env_vars = server_env_vars
         self.server_procs = []
         self.base_port = base_port if base_port is not None else os.environ.get("PORT",14000)
+        self.pre_instance_callback = pre_instance_callback
         self.container_targets = []
         self.running_flag = Value(c_bool, True)
         self.relog = False
@@ -188,6 +190,8 @@ class WitcherAFL(AFL):
             "MANDATORY_POST": str(env_obj.get("MANDATORY_POST", "") or ""),
             "AUTHORIZATION": str(env_obj.get("AUTHORIZATION", "") or ""),
             "HTTP_AUTHORIZATION": str(env_obj.get("HTTP_AUTHORIZATION", "") or ""),
+            "HTTP_HOST": str(env_obj.get("HTTP_HOST", "") or ""),
+            "SERVER_NAME": str(env_obj.get("SERVER_NAME", "") or ""),
         }
         # Never let an empty update erase a previously captured auth value.
         for key in ("LOGIN_COOKIE", "MANDATORY_COOKIE", "MANDATORY_GET", "MANDATORY_POST", "AUTHORIZATION", "HTTP_AUTHORIZATION"):
@@ -240,6 +244,39 @@ class WitcherAFL(AFL):
                     wf.write(f"{k}:\n{self._login_debug_s(v)}\n")
         except Exception:
             pass
+
+    @staticmethod
+    def _debug_env_subset(env_obj):
+        env_obj = env_obj if isinstance(env_obj, dict) else {}
+        keys = (
+            "HTTP_HOST",
+            "SERVER_NAME",
+            "REQUEST_URI",
+            "REQUEST_METHOD",
+            "METHOD",
+            "SCRIPT_FILENAME",
+            "SCRIPT_NAME",
+            "PATH_INFO",
+            "DOCUMENT_ROOT",
+            "REDIRECT_STATUS",
+            "HTTP_REDIRECT_STATUS",
+            "CONTENT_TYPE",
+            "CONTENT_LENGTH",
+            "QUERY_STRING",
+            "LOGIN_COOKIE",
+            "MANDATORY_COOKIE",
+            "MANDATORY_GET",
+            "MANDATORY_POST",
+            "LD_PRELOAD",
+            "LD_LIBRARY_PATH",
+            "STRICT",
+            "WC_INSTRUMENTATION",
+            "NO_WC_EXTRA",
+            "AFL_PRELOAD",
+            "DO_JSON",
+            "WITCHER_PRINT_OP",
+        )
+        return {k: str(env_obj.get(k, "") or "") for k in keys}
 
     @staticmethod
     def _parse_cgi_response(text: str):
@@ -314,6 +351,8 @@ class WitcherAFL(AFL):
                 "post_login_followup",
                 follow_script=script_filename,
                 follow_get=get_qs,
+                stdin_payload=httpdata,
+                env_subset=self._debug_env_subset(env),
                 status=status_line,
                 location=loc,
                 headers=headers,
@@ -399,12 +438,25 @@ class WitcherAFL(AFL):
             parts.append(f"{ks}={'' if v is None else str(v)}")
         return "; ".join(parts)
 
+    @staticmethod
+    def _login_session_cookie_specs(loginconfig: dict):
+        specs = []
+        raw = (loginconfig or {}).get("loginSessionCookie", "")
+        items = raw if isinstance(raw, list) else [raw]
+        for item in items:
+            s = str(item or "").strip()
+            if s:
+                specs.append(s)
+        return specs
+
     @classmethod
     def _preset_login_cookie_from_config(cls, loginconfig: dict) -> str:
-        raw = str((loginconfig or {}).get("loginSessionCookie", "") or "").strip()
-        if not raw or "=" not in raw:
-            return ""
-        return cls._cookie_map_to_header(cls._cookie_map_from_cookie_header(raw))
+        merged = {}
+        for raw in cls._login_session_cookie_specs(loginconfig):
+            if "=" not in raw:
+                continue
+            merged.update(cls._cookie_map_from_cookie_header(raw))
+        return cls._cookie_map_to_header(merged)
 
     @classmethod
     def _merge_cookie_headers(cls, pre_cookie: str, login_cookie: str):
@@ -500,7 +552,7 @@ class WitcherAFL(AFL):
 
     def _inject_login_session_cookie_into_seeds(self, login_cookie: str, loginconfig: dict):
         """
-        If loginSessionCookie is configured, force that one cookie key/value back into
+        If loginSessionCookie is configured, force those cookie key/value pairs back into
         the seed cookie segment after generic login-cookie stripping completes.
         """
         cookie = (login_cookie or "").strip()
@@ -508,29 +560,27 @@ class WitcherAFL(AFL):
             return
         if not self.in_dir or self.in_dir == "-" or not os.path.isdir(self.in_dir):
             return
-        session_cookie_name = ""
-        try:
-            session_cookie_name = str((loginconfig or {}).get("loginSessionCookie", "") or "").strip()
-        except Exception:
-            session_cookie_name = ""
-        if not session_cookie_name:
+        session_cookie_specs = self._login_session_cookie_specs(loginconfig)
+        if not session_cookie_specs:
             return
         login_cookie_map = self._cookie_map_from_cookie_header(cookie)
-        forced_value = None
-        forced_key = session_cookie_name
-        # Support both formats:
-        # - loginSessionCookie="PHPSESSID"
-        # - loginSessionCookie="PHPSESSID=abc123"
-        configured_cookie_map = self._cookie_map_from_cookie_header(session_cookie_name)
-        if configured_cookie_map:
-            forced_key, forced_value = next(iter(configured_cookie_map.items()))
-        else:
-            for ck, cv in login_cookie_map.items():
-                if str(ck or "").strip().lower() == session_cookie_name.lower():
-                    forced_key = ck
-                    forced_value = cv
-                    break
-        if forced_value is None:
+        forced_pairs = {}
+        for session_cookie_name in session_cookie_specs:
+            forced_value = None
+            forced_key = session_cookie_name
+            configured_cookie_map = self._cookie_map_from_cookie_header(session_cookie_name)
+            if configured_cookie_map:
+                forced_key, forced_value = next(iter(configured_cookie_map.items()))
+            else:
+                for ck, cv in login_cookie_map.items():
+                    if str(ck or "").strip().lower() == session_cookie_name.lower():
+                        forced_key = ck
+                        forced_value = cv
+                        break
+            if forced_value is None:
+                continue
+            forced_pairs[forced_key] = forced_value
+        if not forced_pairs:
             return
         try:
             names = sorted(os.listdir(self.in_dir))
@@ -551,7 +601,7 @@ class WitcherAFL(AFL):
                 except Exception:
                     seed_cookie = ""
                 cookie_map = self._cookie_map_from_cookie_header(seed_cookie)
-                cookie_map[forced_key] = forced_value
+                cookie_map.update(forced_pairs)
                 new_cookie = self._cookie_map_to_header(cookie_map)
                 parts[0] = new_cookie.encode("latin-1", errors="ignore")
                 new_data = b"\x00".join(parts)
@@ -610,6 +660,9 @@ class WitcherAFL(AFL):
 
 
     def _start_afl_instance(self, instance_cnt=0):
+
+        if callable(self.pre_instance_callback):
+            self.pre_instance_callback(instance_cnt)
 
         args, fuzzer_id = self.build_args()
 
@@ -931,20 +984,8 @@ class WitcherAFL(AFL):
             getData=loginconfig.get("getData", ""),
             postData=loginconfig.get("postData", ""),
             cookieData=cookieData,
-            env_subset={
-                "LD_LIBRARY_PATH": myenv.get("LD_LIBRARY_PATH", ""),
-                "DOCUMENT_ROOT": myenv.get("DOCUMENT_ROOT", ""),
-                "AFL_SET_AFFINITY": myenv.get("AFL_SET_AFFINITY", ""),
-                "SERVER_NAME": myenv.get("SERVER_NAME", ""),
-                "STRICT": myenv.get("STRICT", ""),
-                "WC_INSTRUMENTATION": myenv.get("WC_INSTRUMENTATION", ""),
-                "NO_WC_EXTRA": myenv.get("NO_WC_EXTRA", ""),
-                "SCRIPT_FILENAME": myenv.get("SCRIPT_FILENAME", ""),
-                "SCRIPT_NAME": myenv.get("SCRIPT_NAME", ""),
-                "METHOD": myenv.get("METHOD", ""),
-                "LOGIN_COOKIE": myenv.get("LOGIN_COOKIE", ""),
-                "MANDATORY_COOKIE": myenv.get("MANDATORY_COOKIE", ""),
-            },
+            stdin_payload=httpdata,
+            env_subset=self._debug_env_subset(myenv),
         )
 
         login_req_file = open("/tmp/login_req.dat", "r")
@@ -1306,6 +1347,7 @@ class WitcherAFL(AFL):
         self._login_debug_write(
             "get_login_done",
             authdata=authdata,
+            env_subset=self._debug_env_subset(my_env),
             final_LOGIN_COOKIE=my_env.get("LOGIN_COOKIE", ""),
             final_AUTHORIZATION=my_env.get("AUTHORIZATION", ""),
             final_HTTP_AUTHORIZATION=my_env.get("HTTP_AUTHORIZATION", ""),

@@ -23,6 +23,7 @@ class DBRuntimePaths:
     queue_dir: str = ""
     runtime_dir: str = ""
     command_lock_dir: str = ""
+    latest_id_path: str = ""
 
 
 def _safe_int(v: Any, default: int = 0) -> int:
@@ -147,6 +148,7 @@ def resolve_db_runtime_paths(*, work_dir: str = "") -> Optional[DBRuntimePaths]:
         queue_dir=queue_dir,
         runtime_dir=runtime_dir,
         command_lock_dir=os.path.join(runtime_dir, "command.lock"),
+        latest_id_path=os.path.join(extsync_dir, "latest_id"),
     )
 
 
@@ -175,14 +177,29 @@ def allocate_external_seed_id(paths: DBRuntimePaths, *, timeout_sec: float = 10.
     if not _acquire_lock(paths.command_lock_dir, timeout_sec=timeout_sec):
         return None
     try:
-        max_id = -1
-        for name in os.listdir(paths.queue_dir):
-            seed_id = _parse_seed_id_from_name(name)
-            if seed_id is None:
-                continue
-            if int(seed_id) > int(max_id):
-                max_id = int(seed_id)
-        return int(max_id) + 1
+        latest_id_path = os.path.abspath(str(paths.latest_id_path or "").strip())
+        if not latest_id_path:
+            return None
+        os.makedirs(os.path.dirname(latest_id_path) or ".", exist_ok=True)
+        cur = -1
+        try:
+            with open(latest_id_path, "a+", encoding="utf-8", errors="replace") as f:
+                f.seek(0)
+                raw = (f.read() or "").strip()
+                if raw:
+                    cur = int(raw)
+                nxt = int(cur) + 1
+                f.seek(0)
+                f.truncate(0)
+                f.write(str(int(nxt)) + "\n")
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except Exception:
+                    pass
+                return int(nxt)
+        except Exception:
+            return None
     finally:
         _release_lock(paths.command_lock_dir)
 

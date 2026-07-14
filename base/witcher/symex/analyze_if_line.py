@@ -82,6 +82,31 @@ def _atomic_write_json(path: str, obj: dict) -> None:
     _atomic_write_text(path, txt)
 
 
+def _append_json_line(path: str, obj: dict) -> None:
+    out_path = os.path.abspath(path or "")
+    if not out_path:
+        return
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    try:
+        txt = json.dumps(obj or {}, ensure_ascii=False, sort_keys=True)
+    except Exception:
+        txt = "{}"
+    with open(out_path, "a", encoding="utf-8", errors="replace") as f:
+        f.write(txt + "\n")
+
+
+def _append_stage_debug(run_dir: str, event: str, **fields) -> None:
+    payload = {
+        "ts": _heartbeat_ts(),
+        "event": str(event or ""),
+        "pid": int(os.getpid()),
+        "ppid": int(os.getppid()),
+    }
+    for k, v in (fields or {}).items():
+        payload[str(k)] = v
+    _append_json_line(os.path.join(os.path.abspath(run_dir), "logs", "stage_debug.ndjson"), payload)
+
+
 def _deep_copy_jsonish(value: Any) -> Any:
     try:
         return json.loads(json.dumps(value, ensure_ascii=False))
@@ -1141,11 +1166,11 @@ def _solution_change_markers(solution: dict, *, defaults: Optional[dict]) -> Lis
     return out
 
 
-def _build_external_seed_name(*, external_seed_id: int, seq: int, solution_index: int, solution: dict, defaults: Optional[dict]) -> str:
+def _build_external_seed_name(*, external_seed_id: int, seq: int, solution_index: int, solution: dict, defaults: Optional[dict], seed_kind_flags: Optional[Dict[str, bool]] = None) -> str:
     parent_seed_info = _resolve_parent_seed_id_info()
     parent_seed_id = str(parent_seed_info.get("resolved_parent_seed_id_text") or parent_seed_info.get("resolved_parent_seed_id") or "unknown")
     source_fuzzer = str(parent_seed_info.get("resolved_source_fuzzer") or "unknown")
-    markers = _seed_mods_from_solution(solution, defaults=defaults)
+    markers = _seed_mods_from_solution(solution, defaults=defaults, seed_kind_flags=seed_kind_flags)
     mods = "+".join(markers) if markers else "NONE"
     parts = [
         "id:%06d" % int(external_seed_id),
@@ -1160,9 +1185,7 @@ def _build_external_seed_name(*, external_seed_id: int, seq: int, solution_index
         env_id = str(solution.get("_WC_ENV_ID") or "").strip()
     except Exception:
         env_id = ""
-    if not env_id and "ENV" in markers:
-        env_id = "%06d" % int(external_seed_id)
-    if env_id:
+    if env_id and "ENV" in markers:
         parts.append("env:%s" % env_id)
     return ",".join(parts)
 
@@ -1242,8 +1265,15 @@ def _solution_mods(solution: dict, *, defaults: Optional[dict]) -> List[str]:
     return markers
 
 
-def _seed_mods_from_solution(solution: dict, *, defaults: Optional[dict]) -> List[str]:
-    return _solution_mods(solution, defaults=defaults)
+def _seed_mods_from_solution(solution: dict, *, defaults: Optional[dict], seed_kind_flags: Optional[Dict[str, bool]] = None) -> List[str]:
+    markers = _solution_mods(solution, defaults=defaults)
+    flags = seed_kind_flags if isinstance(seed_kind_flags, dict) else {}
+    out: List[str] = []
+    for marker in markers:
+        if marker in {"POST", "GET", "COOKIE", "SESSION", "ENV", "SQL", "FILE"} and not bool(flags.get(marker, True)):
+            continue
+        out.append(marker)
+    return out
 
 
 _ACTIVE_EXIT_RECORDER = None
@@ -1262,6 +1292,7 @@ class AnalyzeExitRecorder:
         self._installed = False
         self._previous_handlers = {}
         self._previous_excepthook = None
+        self._debug_path = os.path.join(self.logs_dir, "exit_debug.ndjson")
 
     def install(self) -> None:
         global _ACTIVE_EXIT_RECORDER
@@ -1269,6 +1300,7 @@ class AnalyzeExitRecorder:
         if self._installed:
             return
         self._installed = True
+        self._write_debug("install")
         self._previous_excepthook = sys.excepthook
         sys.excepthook = self._handle_uncaught_exception
         for sig_name in ("SIGTERM", "SIGINT", "SIGHUP", "SIGQUIT"):
@@ -1286,6 +1318,7 @@ class AnalyzeExitRecorder:
             pass
 
     def mark_finished(self, status: str, *, reason: str = "", **extra) -> None:
+        self._write_debug("mark_finished", status=str(status or ""), reason=str(reason or ""), extra=(extra or {}))
         with self._lock:
             self._finalized = True
 
@@ -1293,16 +1326,48 @@ class AnalyzeExitRecorder:
         hb = self.heartbeat._snapshot() if self.heartbeat is not None else {}
         return hb if isinstance(hb, dict) else {}
 
+    def _write_debug(self, event: str, **fields) -> None:
+        payload = {
+            "ts": _heartbeat_ts(),
+            "event": str(event or ""),
+            "seq": int(self.seq),
+            "pid": int(self.pid),
+            "parent_pid": int(self.parent_pid),
+            "heartbeat": self._snapshot(),
+        }
+        for k, v in (fields or {}).items():
+            payload[str(k)] = v
+        try:
+            _append_json_line(self._debug_path, payload)
+        except Exception:
+            pass
+
     def _write_exit_record(self, *, status: str, reason: str = "", extra: Optional[dict] = None, allow_overwrite: bool = False) -> None:
         with self._lock:
             if self._finalized and not allow_overwrite:
                 return
             if not allow_overwrite or status in ("success", "error", "terminated", "uncaught_exception", "abnormal_exit"):
                 self._finalized = True
+        payload = {
+            "ts": _heartbeat_ts(),
+            "status": str(status or ""),
+            "reason": str(reason or ""),
+            "seq": int(self.seq),
+            "pid": int(self.pid),
+            "parent_pid": int(self.parent_pid),
+            "heartbeat": self._snapshot(),
+        }
+        if isinstance(extra, dict):
+            payload.update(extra)
+        try:
+            _append_json_line(os.path.join(self.logs_dir, "exit_record.ndjson"), payload)
+        except Exception:
+            pass
 
     def _make_signal_handler(self, sig_name: str, sig_num: int):
         def _handler(signum, _frame):
             msg = "received %s" % str(sig_name)
+            self._write_debug("signal_received", signal_name=str(sig_name), signal_number=int(sig_num), signum=int(signum))
             try:
                 if self.heartbeat is not None:
                     self.heartbeat.finish(
@@ -1332,6 +1397,12 @@ class AnalyzeExitRecorder:
             tb_text = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
         except Exception:
             tb_text = str(exc_value or "")
+        self._write_debug(
+            "uncaught_exception",
+            exception_type=getattr(exc_type, "__name__", str(exc_type)),
+            exception_message=str(exc_value or ""),
+            traceback=tb_text,
+        )
         try:
             if self.heartbeat is not None:
                 self.heartbeat.finish(
@@ -1359,6 +1430,22 @@ class AnalyzeExitRecorder:
         if self._finalized:
             return
         hb = self._snapshot()
+        self._write_debug(
+            "atexit_unfinished",
+            heartbeat_stage=str(hb.get("stage") or ""),
+            heartbeat_status=str(hb.get("status") or ""),
+        )
+        try:
+            if self.heartbeat is not None:
+                self.heartbeat.finish(
+                    "abnormal_exit",
+                    message="process_exit_without_finish",
+                    reason="process_exit_without_finish",
+                    heartbeat_stage=str(hb.get("stage") or ""),
+                    heartbeat_status=str(hb.get("status") or ""),
+                )
+        except Exception:
+            pass
         self._write_exit_record(
             status="abnormal_exit",
             reason="process_exit_without_finish",
@@ -1911,7 +1998,7 @@ def _write_external_seeds_from_solutions(
     defaults: Optional[dict],
     logger: Optional[Logger] = None,
     seed_kind_flags: Optional[Dict[str, bool]] = None,
-) -> List[str]:
+) -> List[Dict[str, object]]:
     solutions = _filter_solutions_by_seed_kinds(solutions, seed_kind_flags=seed_kind_flags)
     out_dir = _resolve_external_seed_dir(cfg)
     env_parent_dir = _resolve_seed_env_parent_dir(cfg)
@@ -1927,6 +2014,14 @@ def _write_external_seeds_from_solutions(
     except Exception:
         pass
     current_defaults = _merge_defaults_with_base_inputs(defaults, _load_prompt_base_inputs_for_parent_seed(cfg))
+    env_enabled = bool((seed_kind_flags or {}).get("ENV", True))
+    session_enabled = bool((seed_kind_flags or {}).get("SESSION", True))
+    cookie_enabled = bool((seed_kind_flags or {}).get("COOKIE", True))
+    get_enabled = bool((seed_kind_flags or {}).get("GET", True))
+    post_enabled = bool((seed_kind_flags or {}).get("POST", True))
+    sql_enabled = bool((seed_kind_flags or {}).get("SQL", True))
+    file_enabled = bool((seed_kind_flags or {}).get("FILE", True))
+    seed_records: List[Dict[str, object]] = []
     wrote: List[str] = []
     for i, sol in enumerate(solutions or []):
         if logger is not None:
@@ -1953,9 +2048,9 @@ def _write_external_seeds_from_solutions(
                 except Exception:
                     pass
             continue
-        env_marker_map = _env_change_map_from_solution(sol if isinstance(sol, dict) else {}, defaults=current_defaults)
-        effective_env_map = _apply_env_solution_to_defaults(sol if isinstance(sol, dict) else {}, defaults=current_defaults)
-        env_change_map = _diff_env_maps(_env_defaults_to_map(defaults), effective_env_map)
+        env_marker_map = _env_change_map_from_solution(sol if isinstance(sol, dict) else {}, defaults=current_defaults) if env_enabled else {}
+        effective_env_map = _apply_env_solution_to_defaults(sol if isinstance(sol, dict) else {}, defaults=current_defaults) if env_enabled else _env_defaults_to_map(defaults)
+        env_change_map = _diff_env_maps(_env_defaults_to_map(defaults), effective_env_map) if env_enabled else {}
         env_id = ("%06d" % int(sid)) if env_change_map else ""
         if logger is not None:
             try:
@@ -1979,7 +2074,32 @@ def _write_external_seeds_from_solutions(
             defaults=defaults,
             logger=logger,
         )
-        if env_id:
+        if not session_enabled:
+            sol2.pop("SESSION", None)
+            sol2.pop("_WC_PHPSESSID", None)
+            sol2.pop("_WC_SESSION_COOKIE_NAME", None)
+            sess_file_path = ""
+        if not cookie_enabled:
+            sol2.pop("COOKIE", None)
+            sol2.pop("_WC_PHPSESSID", None)
+            sol2.pop("_WC_SESSION_COOKIE_NAME", None)
+        if not get_enabled:
+            sol2.pop("GET", None)
+        if not post_enabled:
+            sol2.pop("POST", None)
+        if not env_enabled:
+            sol2.pop("ENV", None)
+            sol2.pop("_WC_ENV_ID", None)
+        if not sql_enabled:
+            sol2.pop("SQL", None)
+            sol2.pop("DB_REQUEST", None)
+            sol2.pop("DB_QUERY", None)
+            sol2.pop("DBREQUEST", None)
+        if not file_enabled:
+            sol2.pop(_WITCHER_FILE_UPLOAD_FIELD, None)
+            sol2.pop(_WITCHER_FILE_PATH_FIELD, None)
+            created_file_paths = []
+        if env_enabled and env_id:
             sol2["_WC_ENV_ID"] = env_id
         data = _solution_to_afl_seed_bytes(sol2, defaults=defaults)
         if logger is not None:
@@ -2021,8 +2141,9 @@ def _write_external_seeds_from_solutions(
             external_seed_id=int(sid),
             seq=int(seq),
             solution_index=int(i),
-            solution=sol if isinstance(sol, dict) else {},
+            solution=sol2,
             defaults=current_defaults,
+            seed_kind_flags=seed_kind_flags,
         )
         if logger is not None:
             try:
@@ -2096,6 +2217,15 @@ def _write_external_seeds_from_solutions(
                 solution_index=int(i),
             )
         wrote.append(out_path)
+        seed_records.append(
+            {
+                "solution_index": int(i),
+                "seed_id": int(sid),
+                "seed_path": str(out_path or ""),
+                "seed_name": str(name or ""),
+                "mods": _seed_mods_from_solution(sol2, defaults=current_defaults, seed_kind_flags=seed_kind_flags),
+            }
+        )
         if logger is not None:
             try:
                 logger.info(
@@ -2116,7 +2246,7 @@ def _write_external_seeds_from_solutions(
             logger.info("external_seed_write_done", dir=out_dir, seq=int(seq), count=len(wrote))
         except Exception:
             pass
-    return wrote
+    return seed_records
 
 
 def _load_symbolic_seed_kind_flags_for_cfg(cfg=None) -> Dict[str, bool]:
@@ -3691,6 +3821,7 @@ def _run_symbolic_with_json_retry(prompt_text: str, *, run_dir: str, seq: int, l
     tries = max(1, int(attempts or 1))
     last = {}
     for i in range(tries):
+        _append_stage_debug(run_dir, "symbolic_json_retry_attempt_enter", seq=int(seq), attempt=int(i + 1), attempt_limit=int(tries))
         rr = run_symbolic_prompt(
             prompt_text,
             run_dir=run_dir,
@@ -3698,8 +3829,10 @@ def _run_symbolic_with_json_retry(prompt_text: str, *, run_dir: str, seq: int, l
             llm_offline=False,
             logger=logger,
         )
+        _append_stage_debug(run_dir, "symbolic_json_retry_attempt_after_run", seq=int(seq), attempt=int(i + 1), response_obj_count=len(rr.get('response_obj') or []) if isinstance(rr, dict) else 0, has_response_path=bool(isinstance(rr, dict) and rr.get('response_path')), has_response_json_path=bool(isinstance(rr, dict) and rr.get('response_json_path')))
         last = rr if isinstance(rr, dict) else {}
         ok = _llm_response_has_valid_json(run_dir, int(seq))
+        _append_stage_debug(run_dir, "symbolic_json_retry_attempt_after_validate", seq=int(seq), attempt=int(i + 1), json_valid=bool(ok))
         if logger is not None:
             try:
                 logger.info(
@@ -3716,6 +3849,7 @@ def _run_symbolic_with_json_retry(prompt_text: str, *, run_dir: str, seq: int, l
                 pass
         if ok:
             break
+    _append_stage_debug(run_dir, "symbolic_json_retry_return", seq=int(seq), attempt_limit=int(tries), final_response_obj_count=len(last.get('response_obj') or []) if isinstance(last, dict) else 0)
     return last
 
 def _run_analyze_once(
@@ -3945,7 +4079,9 @@ def _run_analyze_once(
     if prompt_mode:
         try:
             heartbeat.update("prompt_building", status="running", prompt_mode=True)
+            _append_stage_debug(run_dir, "prompt_building_enter", seq=int(n), llm_mode=bool(opts.get('llm_mode')), test_mode=bool(test_mode), result_set=len(rs2 or []))
             prompt_base_inputs = _load_prompt_base_inputs_for_parent_seed(cfg)
+            _append_stage_debug(run_dir, "prompt_base_inputs_loaded", seq=int(n), has_base_inputs=bool(isinstance(prompt_base_inputs, dict) and prompt_base_inputs))
             if sql_mode:
                 prompt_builder = generate_sql_symbolic_execution_prompt
             elif xss_mode:
@@ -3954,6 +4090,9 @@ def _run_analyze_once(
                 prompt_builder = generate_cmd_symbolic_execution_prompt
             else:
                 prompt_builder = generate_symbolic_execution_prompt
+            _append_stage_debug(run_dir, "prompt_builder_selected", seq=int(n), builder=getattr(prompt_builder, '__name__', 'unknown'))
+            prompt_inputs = dict(prompt_base_inputs) if isinstance(prompt_base_inputs, dict) else {}
+            prompt_inputs['__WITCHER_RUN_DIR__'] = run_dir
             prompt_text = prompt_builder(
                 rs2,
                 input_seq=n,
@@ -3963,7 +4102,7 @@ def _run_analyze_once(
                 trace_index_path=trace_index_path,
                 windows_root=ctx.get('windows_root') or r'D:\files\witcher\app',
                 base_prompt=None,
-                base_inputs=prompt_base_inputs if isinstance(prompt_base_inputs, dict) else None,
+                base_inputs=prompt_inputs,
                 trace_index_records=ctx.get('trace_index_records') if isinstance(ctx.get('trace_index_records'), list) else None,
                 trace_seq_to_index=ctx.get('trace_seq_to_index') if isinstance(ctx.get('trace_seq_to_index'), dict) else None,
                 nodes=ctx.get('nodes') if isinstance(ctx.get('nodes'), dict) else None,
@@ -3971,8 +4110,10 @@ def _run_analyze_once(
                 children_of=ctx.get('children_of') if isinstance(ctx.get('children_of'), dict) else None,
                 top_id_to_file=ctx.get('top_id_to_file') if isinstance(ctx.get('top_id_to_file'), dict) else None,
             )
+            _append_stage_debug(run_dir, "prompt_built", seq=int(n), prompt_len=len(prompt_text or ""))
             if bool(opts.get('llm_mode')) and not test_mode:
                 heartbeat.update("symbolic_llm_running", status="running", llm_mode=True, test_mode=False)
+                _append_stage_debug(run_dir, "symbolic_llm_before_run", seq=int(n), retry_attempts=int(retry_cfg.get('llm_json_retry_attempts') or 3))
                 rr = _run_symbolic_with_json_retry(
                     prompt_text,
                     run_dir=run_dir,
@@ -3980,6 +4121,7 @@ def _run_analyze_once(
                     logger=logger,
                     attempts=int(retry_cfg.get('llm_json_retry_attempts') or 3),
                 )
+                _append_stage_debug(run_dir, "symbolic_llm_after_run", seq=int(n), response_obj_count=len(rr.get('response_obj') or []) if isinstance(rr, dict) else 0, has_response_path=bool(isinstance(rr, dict) and rr.get('response_path')), has_response_json_path=bool(isinstance(rr, dict) and rr.get('response_json_path')))
                 out['symbolic_prompt_path'] = rr.get('prompt_path')
                 out['symbolic_response_path'] = rr.get('response_path')
                 out['symbolic_response_json_path'] = rr.get('response_json_path')
@@ -3999,6 +4141,7 @@ def _run_analyze_once(
                     pass
                 try:
                     heartbeat.update("writing_external_seeds", status="running", llm_mode=True)
+                    _append_stage_debug(run_dir, "writing_external_seeds_enter", seq=int(n))
                     output_root = _resolve_output_root(cfg)
                     defaults = load_symbolic_solution_defaults(cfg.find_input_file('test_command.txt'))
                     raw_response_obj = rr.get('response_obj')
@@ -4045,7 +4188,9 @@ def _run_analyze_once(
                         )
                     except Exception:
                         pass
+                    _append_stage_debug(run_dir, "writing_external_seeds_before_write", seq=int(n), solution_count=len(sols or []), existing_external_path_count=len(external_paths or []), json_reload_attempted=bool(json_reload_attempted), json_reload_succeeded=bool(json_reload_succeeded), json_reload_used_raw_response=bool(json_reload_used_raw_response))
                     local_external_paths = _write_external_seeds_from_solutions(sols or [], cfg=cfg, seq=int(n), defaults=defaults, logger=logger, seed_kind_flags=seed_kind_flags)
+                    _append_stage_debug(run_dir, "writing_external_seeds_after_write", seq=int(n), local_external_path_count=len(local_external_paths or []))
                     seen_external_paths = set()
                     merged_external_paths = []
                     for p in list(external_paths or []) + [p for p in (local_external_paths or []) if p]:
@@ -4064,12 +4209,16 @@ def _run_analyze_once(
                             _ = inc_count(ctx.get("path"), ctx.get("line"), inc=1)
                         except Exception:
                             pass
-                except Exception:
+                except Exception as exc:
+                    _append_stage_debug(run_dir, "writing_external_seeds_failed", seq=int(n), error=str(exc))
                     logger.exception('write_external_seeds_failed')
                 symbolic_empty = _symbolic_solutions_is_empty(out.get("symbolic_solutions"))
+                _append_stage_debug(run_dir, "prompt_llm_branch_done", seq=int(n), symbolic_empty=bool(symbolic_empty), external_seed_path_count=len(out.get("external_seed_paths") or []), symbolic_solution_count=len(out.get("symbolic_solutions") or []))
             else:
                 heartbeat.update("writing_symbolic_prompt", status="running", llm_mode=False, test_mode=bool(test_mode))
+                _append_stage_debug(run_dir, "writing_symbolic_prompt_enter", seq=int(n), test_mode=bool(test_mode))
                 prompt_path = write_symbolic_prompt(prompt_text, run_dir=run_dir, seq=int(n))
+                _append_stage_debug(run_dir, "writing_symbolic_prompt_done", seq=int(n), prompt_path=str(prompt_path or ""))
                 out['symbolic_prompt_path'] = prompt_path
                 if test_mode:
                     raw_path, json_path = write_symbolic_response(build_symbolic_response_example(), run_dir=run_dir, seq=int(n))
@@ -4099,7 +4248,8 @@ def _run_analyze_once(
                                 pass
                     except Exception:
                         logger.exception('write_external_seeds_failed')
-        except Exception:
+        except Exception as exc:
+            _append_stage_debug(run_dir, "prompt_failed", seq=int(n), error=str(exc))
             heartbeat.update("prompt_failed", status="running", message="write_symbolic_prompt_failed")
             logger.exception('write_symbolic_prompt_failed')
     return finish(out, symbolic_empty=symbolic_empty)

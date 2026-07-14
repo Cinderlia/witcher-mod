@@ -17,6 +17,28 @@ DEFAULT_TEST_COMMAND_PATH = os.path.join("input", "test_command.txt")
 DEFAULT_URL_PATH = os.path.join("input", "url.txt")
 
 
+def _append_prompt_stage_debug(base_inputs: Optional[Dict[str, Any]], event: str, **fields) -> None:
+    if not isinstance(base_inputs, dict):
+        return
+    run_dir = str(base_inputs.get("__WITCHER_RUN_DIR__") or "").strip()
+    if not run_dir:
+        return
+    payload = {
+        "event": str(event or ""),
+        "pid": int(os.getpid()),
+        "ppid": int(os.getppid()),
+    }
+    for k, v in (fields or {}).items():
+        payload[str(k)] = v
+    try:
+        logs_dir = os.path.join(os.path.abspath(run_dir), "logs")
+        os.makedirs(logs_dir, exist_ok=True)
+        with open(os.path.join(logs_dir, "stage_debug.ndjson"), "a", encoding="utf-8", errors="replace") as f:
+            f.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+    except Exception:
+        pass
+
+
 def _import_prompt_utils():
     try:
         from llm_utils.prompts.prompt_utils import map_result_set_to_source_lines
@@ -684,6 +706,7 @@ def generate_symbolic_execution_prompt(
     children_of: Optional[Dict[int, List[int]]] = None,
     top_id_to_file: Optional[Dict[int, str]] = None,
 ) -> str:
+    _append_prompt_stage_debug(base_inputs, "gsep_enter", input_seq=input_seq, result_set_type=type(result_set_or_path).__name__)
     map_result_set_to_source_lines = _import_prompt_utils()
     trace_index_path2 = _resolve_existing_path(
         trace_index_path,
@@ -743,15 +766,19 @@ def generate_symbolic_execution_prompt(
                         input_line = None
                 break
     rs = _merge_initial_seq_into_result_set(rs, input_seq=input_seq, input_path=input_path, input_line=input_line)
+    _append_prompt_stage_debug(base_inputs, "gsep_inputs_ready", input_seq=input_seq, input_path=str(input_path or ""), input_line=input_line, result_set_count=len(rs or []), trace_index_path=str(trace_index_path2 or ""), provided_trace_index_records=len(provided_trace_index_records))
     if callable(map_result_set_to_source_lines):
+        _append_prompt_stage_debug(base_inputs, "gsep_before_map_result_set", result_set_count=len(rs or []))
         mapped = map_result_set_to_source_lines(
             scope_root,
             rs,
             trace_index_path=trace_index_path2,
             windows_root=windows_root,
         )
+        _append_prompt_stage_debug(base_inputs, "gsep_after_map_result_set", mapped_count=len(mapped or []))
     else:
         mapped = list(rs or [])
+        _append_prompt_stage_debug(base_inputs, "gsep_map_result_set_skipped", mapped_count=len(mapped or []))
 
     infer_if_directions_for_seqs, load_trace_index_records = _import_if_branch_utils()
     infer_switch_choices_for_seqs, build_seq_to_case_label, build_switch_case_result_set_for_seq, insert_mapped_items_after_seq = _import_switch_branch_utils()
@@ -775,25 +802,34 @@ def generate_symbolic_execution_prompt(
     )
     if have_graph:
         try:
+            _append_prompt_stage_debug(base_inputs, "gsep_graph_enter", if_seq_count=len(if_seqs or []), have_trace_records=bool(trace_index_records2), have_nodes=bool(nodes2), have_children=bool(children_of2))
             if not trace_index_records2 and trace_index_path2 and os.path.exists(trace_index_path2):
                 trace_index_records2 = load_trace_index_records(trace_index_path2)
+                _append_prompt_stage_debug(base_inputs, "gsep_graph_trace_loaded", trace_record_count=len(trace_index_records2 or []))
             if not nodes2 and nodes_path2 and os.path.exists(nodes_path2):
                 nodes2, top_id_to_file2 = load_nodes(nodes_path2)
+                _append_prompt_stage_debug(base_inputs, "gsep_graph_nodes_loaded", node_count=len(nodes2 or {}), top_file_count=len(top_id_to_file2 or {}))
             if not children_of2 and rels_path2 and os.path.exists(rels_path2):
                 parent_of2, children_of2 = load_ast_edges(rels_path2)
+                _append_prompt_stage_debug(base_inputs, "gsep_graph_edges_loaded", parent_count=len(parent_of2 or {}), child_count=len(children_of2 or {}))
+            _append_prompt_stage_debug(base_inputs, "gsep_before_if_dirs", if_seq_count=len(if_seqs or []))
             if_dirs = infer_if_directions_for_seqs(
                 if_seqs,
                 trace_index_records=trace_index_records2,
                 nodes=nodes2,
                 children_of=children_of2,
             )
+            _append_prompt_stage_debug(base_inputs, "gsep_after_if_dirs", if_dir_count=len(if_dirs or []))
+            _append_prompt_stage_debug(base_inputs, "gsep_before_switch_choices", if_seq_count=len(if_seqs or []))
             switch_choices = infer_switch_choices_for_seqs(
                 if_seqs,
                 trace_index_records=trace_index_records2,
                 nodes=nodes2,
                 children_of=children_of2,
             )
-        except Exception:
+            _append_prompt_stage_debug(base_inputs, "gsep_after_switch_choices", switch_choice_count=len(switch_choices or []))
+        except Exception as exc:
+            _append_prompt_stage_debug(base_inputs, "gsep_graph_failed", error=str(exc))
             trace_index_records2 = []
             nodes2 = {}
             top_id_to_file2 = {}
@@ -832,12 +868,14 @@ def generate_symbolic_execution_prompt(
     except Exception:
         input_seq_i = None
     if have_graph and input_seq_i is not None:
+        _append_prompt_stage_debug(base_inputs, "gsep_before_case_rs", input_seq=input_seq_i)
         case_rs = build_switch_case_result_set_for_seq(
             int(input_seq_i),
             trace_index_records=trace_index_records2,
             nodes=nodes2,
             children_of=children_of2,
         )
+        _append_prompt_stage_debug(base_inputs, "gsep_after_case_rs", case_rs_count=len(case_rs or []))
         if case_rs:
             mapped_cases = map_result_set_to_source_lines(
                 scope_root,
@@ -845,7 +883,9 @@ def generate_symbolic_execution_prompt(
                 trace_index_path=trace_index_path2,
                 windows_root=windows_root,
             )
+            _append_prompt_stage_debug(base_inputs, "gsep_after_map_case_rs", mapped_case_count=len(mapped_cases or []))
             mapped = insert_mapped_items_after_seq(mapped or [], after_seq=int(input_seq_i), insert_items=mapped_cases or [])
+            _append_prompt_stage_debug(base_inputs, "gsep_after_insert_case_rs", mapped_count=len(mapped or []))
 
     switch_case_line_map: Dict[int, List[dict]] = {}
     switch_coverage_summary: Dict[int, Dict[int, bool]] = {}
@@ -868,6 +908,7 @@ def generate_symbolic_execution_prompt(
 
     if have_graph and mapped:
         try:
+            _append_prompt_stage_debug(base_inputs, "gsep_scope_filter_enter", mapped_count=len(mapped or []))
             _filter_define_locs_from_include, _filter_func_def_locs_from_include = _import_scope_filter_utils()
             scope_ctx = {
                 "initial_taints": (analysis_obj or {}).get("initial_taints") if isinstance(analysis_obj, dict) else None,
@@ -894,8 +935,11 @@ def generate_symbolic_execution_prompt(
                         keep_locs.add(loc)
                 except Exception:
                     continue
+            _append_prompt_stage_debug(base_inputs, "gsep_before_filter_func_defs", loc_count=len(locs), keep_loc_count=len(keep_locs))
             locs2 = _filter_func_def_locs_from_include(list(locs), trace_index_records2, nodes2, scope_ctx)
+            _append_prompt_stage_debug(base_inputs, "gsep_after_filter_func_defs", loc_count=len(locs2 or []))
             locs2 = _filter_define_locs_from_include(locs2, trace_index_records2, nodes2, children_of2, scope_ctx.get("parent_of") or {}, scope_ctx)
+            _append_prompt_stage_debug(base_inputs, "gsep_after_filter_defines", loc_count=len(locs2 or []))
             loc_set = set(locs2) | set(keep_locs)
             if loc_set:
                 filtered = []
@@ -913,16 +957,20 @@ def generate_symbolic_execution_prompt(
                     if loc in loc_set:
                         filtered.append(it)
                 mapped = filtered
-        except Exception:
+                _append_prompt_stage_debug(base_inputs, "gsep_scope_filter_applied", filtered_count=len(mapped or []))
+        except Exception as exc:
+            _append_prompt_stage_debug(base_inputs, "gsep_scope_filter_failed", error=str(exc))
             pass
 
     INPUT_VALUE_MASK_NOTICE, collect_prompt_input_blocks, append_standard_input_sections = _import_prompt_input_utils()
+    _append_prompt_stage_debug(base_inputs, "gsep_before_collect_inputs")
     input_blocks = collect_prompt_input_blocks(
         test_command_path=DEFAULT_TEST_COMMAND_PATH,
         url_path=DEFAULT_URL_PATH,
         hidden_env_keys={"OPCODE_TRACE", "SCRIPT_FILENAME", "LOGIN_COOKIE", "SCRIPT_NAME"},
         base_inputs=base_inputs if isinstance(base_inputs, dict) else None,
     )
+    _append_prompt_stage_debug(base_inputs, "gsep_after_collect_inputs", input_block_keys=sorted(list(input_blocks.keys())) if isinstance(input_blocks, dict) else [])
     env_block = str(input_blocks.get("env_block") or "")
     cookie_block = str(input_blocks.get("cookie_block") or "")
     get_block = str(input_blocks.get("get_block") or "")
@@ -1012,9 +1060,17 @@ def generate_symbolic_execution_prompt(
         from llm_utils.prompts.structured_context import structure_mapped_context
     except Exception:
         structure_mapped_context = None
+    _append_prompt_stage_debug(base_inputs, "gsep_before_structure_context", mapped_count=len(mapped or []), has_structure_helper=bool(structure_mapped_context is not None))
+    structured_input = []
+    for it in mapped or []:
+        if isinstance(it, dict):
+            structured_input.append({**it, "__WITCHER_RUN_DIR__": str((base_inputs or {}).get("__WITCHER_RUN_DIR__") or "")})
+        else:
+            structured_input.append(it)
     structured = (
-        structure_mapped_context(mapped, nodes2, parent_of2, top_id_to_file2) if structure_mapped_context is not None else mapped
+        structure_mapped_context(structured_input, nodes2, parent_of2, top_id_to_file2) if structure_mapped_context is not None else mapped
     )
+    _append_prompt_stage_debug(base_inputs, "gsep_after_structure_context", structured_count=len(structured or []))
     context_items = []
     for it in structured or []:
         if not isinstance(it, dict):
@@ -1098,6 +1154,7 @@ def generate_symbolic_execution_prompt(
             continue
         contiguous_dedup_items.append(item)
 
+    _append_prompt_stage_debug(base_inputs, "gsep_context_items_ready", raw_context_count=len(context_items), dedup_context_count=len(contiguous_dedup_items))
     for item in contiguous_dedup_items:
         lines.append(f"{item['seq_s']} | {item['loc']} | {item['code_s']}")
     lines.append("")
@@ -1199,7 +1256,9 @@ def generate_symbolic_execution_prompt(
         lines.append("    }")
     lines.append("  ]")
     lines.append("}")
-    return "\n".join(lines).rstrip() + "\n"
+    prompt_text = "\n".join(lines).rstrip() + "\n"
+    _append_prompt_stage_debug(base_inputs, "gsep_return", line_count=len(lines), prompt_len=len(prompt_text or ""))
+    return prompt_text
 
 
 def write_symbolic_execution_prompt_from_analysis(
