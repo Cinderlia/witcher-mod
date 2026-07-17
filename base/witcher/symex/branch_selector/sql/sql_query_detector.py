@@ -70,7 +70,7 @@ _SQL_FUNC_NAMES = {
     "fbsql_query",
     "fbsql_db_query",
     
-    # 废弃但可能存在的
+    # Deprecated but possibly still present
     "mssql_query",
 }
 
@@ -88,7 +88,7 @@ _SQL_METHOD_NAMES = {
     "exec",
     "query",
     
-    # 通用的数据库抽象层方法（直接执行SQL的）
+    # Generic database abstraction-layer methods that execute SQL directly
     "select",
     "insert",
     "update",

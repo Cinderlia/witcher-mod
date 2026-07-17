@@ -25,8 +25,8 @@ def _shorten(s: str, limit: int = 2000) -> str:
 
 def main():
     ap = argparse.ArgumentParser(description="LLM client smoke test")
-    ap.add_argument("--prompt", default="给我一个一句话总结")
-    ap.add_argument("--system", default="你是一个严谨的代码助手")
+    ap.add_argument("--prompt", default="Give me a one-sentence summary.")
+    ap.add_argument("--system", default="You are a rigorous code assistant.")
     ap.add_argument("--temperature", type=float, default=None)
     ap.add_argument("--model", type=str, default=None)
     ap.add_argument("--max-tokens", type=int, default=None)

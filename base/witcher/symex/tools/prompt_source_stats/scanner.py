@@ -40,7 +40,7 @@ class PromptCodeBlock:
         if reference_lines:
             lines.extend(reference_lines)
             lines.append("")
-        lines.append("代码上下文：")
+        lines.append("Code context:")
         lines.extend(self.code_lines)
         return "\n".join(lines).rstrip() + "\n"
 
@@ -70,7 +70,10 @@ def _extract_context_items(prompt_text: str) -> List[ContextItem]:
         line = raw_line.rstrip("\r\n")
         stripped = line.strip()
         if not in_context:
-            if "代码上下文" in stripped and "|" in stripped:
+            if stripped == "Code context:" or stripped == "Code context (each line: seq | path:line | code):":
+                in_context = True
+                continue
+            if stripped.endswith("| code):") and "seq |" in stripped and "path:line |" in stripped:
                 in_context = True
             continue
 
@@ -115,10 +118,12 @@ def _extract_reference_data(prompt_text: str) -> Dict[str, object]:
 
     for index, raw_line in enumerate(lines):
         stripped = raw_line.strip()
-        if start_index is None and stripped == "本次执行的环境变量是：":
+        if start_index is None and stripped == "Environment variables for this execution:":
             start_index = index
             continue
-        if start_index is not None and stripped.startswith("代码上下文"):
+        if start_index is not None and (
+            stripped == "Code context:" or stripped == "Code context (each line: seq | path:line | code):"
+        ):
             end_index = index
             break
 
@@ -266,12 +271,12 @@ def _sanitize_reference_lines(raw_lines: List[str]) -> Dict[str, object]:
         if not stripped:
             continue
 
-        if stripped == "本次执行的环境变量是：":
+        if stripped == "Environment variables for this execution:":
             in_env_block = True
             pending_seed = False
             continue
 
-        if stripped == "本次执行的输入是：":
+        if stripped == "Input for this execution:":
             in_env_block = False
             pending_seed = False
             continue
@@ -306,10 +311,10 @@ def _sanitize_reference_lines(raw_lines: List[str]) -> Dict[str, object]:
 
 
 def _build_reference_lines(env_keys: List[str], input_keys: Dict[str, List[str]]) -> List[str]:
-    lines = ["本次执行的环境变量是："]
+    lines = ["Environment variables for this execution:"]
     lines.extend(_dedupe_keep_order(env_keys or []))
     lines.append("")
-    lines.append("本次执行的输入是：")
+    lines.append("Input for this execution:")
     for label in ("COOKIE", "GET", "POST", "SESSION", "SEED"):
         keys = _dedupe_keep_order((input_keys or {}).get(label, []) or [])
         if keys:

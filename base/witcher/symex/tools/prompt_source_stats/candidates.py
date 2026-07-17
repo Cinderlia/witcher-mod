@@ -272,10 +272,10 @@ def _merge_reference_lines(blocks: List[PromptCodeBlock]) -> List[str]:
     for label in list(input_keys.keys()):
         input_keys[label] = _dedupe_keep_order(input_keys[label])
 
-    lines = ["本次执行的环境变量是："]
+    lines = ["Environment variables for this execution:"]
     lines.extend(env_keys)
     lines.append("")
-    lines.append("本次执行的输入是：")
+    lines.append("Input for this execution:")
     for label in ("COOKIE", "GET", "POST", "SESSION", "SEED"):
         keys = input_keys.get(label, [])
         if keys:

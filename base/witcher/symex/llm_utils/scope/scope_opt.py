@@ -182,13 +182,13 @@ def build_merged_llm_prompt(*, merged_members: List[dict], result_set: str) -> s
         if tt == 'AST_PROP':
             has_prop = True
         items.append(f"- {tt} {nm}")
-    head = "你是一个代码分析助手,请你找出下列代码中所有的有可能影响到以下污点取值的变量和函数调用：\n"
+    head = "You are a code analysis assistant. In the following code, identify all variables and function calls that could affect the values of the following taints:\n"
     head += "\n".join(items) + "\n"
     out = head + tail.replace("{result_set}", str(result_set or ""))
     if has_prop:
         out += (
-            "\n注意：代码块中可能包含展开的函数scope，范围用FUNCTION_SCOPE_START和FUNCTION_SCOPE_END标记。"
-            "\n在类方法的函数scope内，this指代当前对象本身：this->x 等价于 对象->x。"
+            "\nNote: The code block may contain expanded function scopes, marked with FUNCTION_SCOPE_START and FUNCTION_SCOPE_END."
+            "\nWithin a function scope of a class method, $this refers to the current object itself: $this->x is equivalent to object->x."
         )
     return out
 

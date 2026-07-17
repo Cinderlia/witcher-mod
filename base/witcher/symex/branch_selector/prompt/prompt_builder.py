@@ -13,38 +13,40 @@ if _ROOT not in sys.path:
 from common.app_config import append_app_name_to_prompt, load_symex_app_config
 from common.logger import Logger
 
-BASE_PROMPT = """你是一个专注于攻击面分析的渗透测试专家，正在寻找所有可能由用户控制的分支路径。
-你的目标是最大化符号执行的覆盖范围，尽可能多地发现潜在的攻击向量。
+BASE_PROMPT = """You are a penetration testing expert specializing in attack surface analysis, tasked with identifying all possible branch paths that could be controlled by the user.
+Your goal is to maximize the coverage of symbolic execution as much as possible, discovering as many potential attack vectors as possible.
 
-只选择前面有标明序号的if语句，if语句的变量来源展示在if语句的下方，不同if语句之间有”===“分隔。
-需要根据if语句以及变量来源，判断是否需要选择该分支。
+Only select the if or switch statements with numbers preceding them, and show the variables' sources below the if statement.
+Different if or switch case statements are separated by "==="".
 
-核心指导思想：宁可选错，也不要放过任何一个有可能的分支。
+For each if or switch case statement, decide whether to select it based on the statement itself and the variable source provided.
 
-明确规则：
-1. 【必须选】如果分支语句中的变量可能直接或间接来源于用户输入（GET、POST、COOKIE、HTTP头部等）
-2. 【必须选】如果分支语句中的变量可能来源于环境变量（如getenv）
-3. 【必须选】如果分支语句中的变量可能来源于SESSION文件存储
-4. 【必须选】如果分支语句中的变量可能来源于数据库查询结果
-5. 【必须选】如果分支语句中的变量可能来源于用户上传的文件或者读取的文件路径受用户控制
-6. 【不要选】如果变量大概率来源于本地文件、硬编码配置
-7. 【不要选】如果变量很可能来源于数据库连接（不包括查询结果数据）
-8. 【不要选】如果是系统环境检查（PHP版本、SQL版本、系统版本等），或者服务器环境检查（如Apache、Nginx等）
-9. 【不要选】如果是本地文件存在性检查
-10. 【不要选】如果是数据库连接测试或组件功能验证
-11. 【不要选】如果是检查常量是否已经被定义
-12. 【不要选】如果是检查环境变量是否已经被定义
-13. 【不要选】如果是检查某个类、函数、方法是否存在或是否可访问
-14. 【应该选】对于不确定来源的变量，优先考虑它是否可能来自GET、POST、COOKIE、SESSION、环境变量、数据库查询结果或用户可控制的文件
-15. 【应该选】如果变量名或使用模式暗示可能是用户输入（如$input、$param、$data等），选择该分支
-16. 【应该选】对于处理业务数据的变量，倾向于认为可能来自用户输入
+Guiding principle: It is better to make a false positive than to miss a potentially exploitable branch.
 
-如果明确规则没有覆盖到的话，请选择可能被外部输入影响的分支。
+Explicit rules:
+1. [MUST SELECT] If the variable in the branch statement may originate directly or indirectly from user input (GET, POST, COOKIE, HTTP headers, etc.)
+2. [MUST SELECT] If the variable in the branch statement may originate from environment variables (e.g., getenv).
+3. [MUST SELECT] If the variable in the branch statement may originate from SESSION file storage.
+4. [MUST SELECT] If the variable in the branch statement may originate from database query results.
+5. [MUST SELECT] If the variable in the branch statement may originate from user-uploaded files or read file paths controlled by the user.
+6. [DO NOT SELECT] If the variable most likely originates from local files or hardcoded configuration.
+7. [DO NOT SELECT] If the variable most likely originates from database connection (excluding query results).
+8. [DO NOT SELECT] If the variable is a system environment check (PHP version, SQL version, system version, etc.) or a server environment check (e.g., Apache, Nginx, etc.).
+9. [DO NOT SELECT] If the variable is a local file existence check.
+10. [DO NOT SELECT] If the variable is a database connection test or component functionality verification.
+11. [DO NOT SELECT] If the variable is a constant definition.
+12. [DO NOT SELECT] If the variable is an environment variable definition.
+13. [DO NOT SELECT] If the variable is a class, function, or method definition.
+14. [SHOULD SELECT] For variables that are uncertain about their source, prioritize whether they might originate from GET, POST, COOKIE, SESSION, environment variables, database query results, or user-controllable files.
+15. [SHOULD SELECT] If the variable name or usage pattern suggests it may be user input (e.g., $input, $param, $data), select the branch.
+16. [SHOULD SELECT] For business data variables, it is generally assumed that they may originate from user input.
 
-输出格式：
-仅输出一个JSON数组，包含被选择分支前面的编号。如果没有选择任何分支，也需要返回一个合法的空数组。
-示例：[123, 456, 789]
-不要输出任何其他内容。"""
+If the explicit rules do not cover all possible scenarios, please select any branch that is likely to be influenced by external inputs.
+
+Output Format:
+Only output a JSON array containing the numbers of the selected if or switch case statements. If no branch is selected, return an empty array.
+Example: [123, 456, 789]
+Do not output any other content. """
 
 
 def build_prompt(*, sections: Iterable[dict], separator: str, base_prompt: Optional[str] = None, logger: Optional[Logger] = None) -> str:

@@ -179,7 +179,7 @@ def build_app_name_prompt_line(raw_or_cfg: Any) -> str:
     app_name = get_app_name(raw_or_cfg)
     if not app_name:
         return ""
-    return "下面的代码来自" + app_name
+    return "The following code comes from " + app_name
 
 
 def append_app_name_to_prompt(prompt_text: str, raw_or_cfg: Any) -> str:

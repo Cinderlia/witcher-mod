@@ -196,8 +196,8 @@ def run_point_coverage(cc_json_path: str, out_dir: str) -> dict[str, Any]:
 
 def _build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="cc_point_coverage")
-    p.add_argument("input", help="输入 .cc.json 覆盖率文件路径")
-    p.add_argument("output_dir", help="输出目录")
+    p.add_argument("input", help="Path to the .cc.json coverage file")
+    p.add_argument("output_dir", help="Output directory")
     return p
 
 

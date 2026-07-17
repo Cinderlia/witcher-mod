@@ -2892,8 +2892,8 @@ def build_initial_taints(st, nodes, children_of, parent_of):
     return build_initial_taints_for_statement(st, nodes, children_of, parent_of)
 
 IF_LLM_TAINT_TEMPLATE = (
-    "你是一个代码分析助手,请你找出下列代码中"
-    "所有的有可能影响到布尔量({name})取值的变量和函数调用"
+    "You are a code analysis assistant. In the following code, identify "
+    "all variables and function calls that could affect the value of the boolean quantity ({name})"
     + _DEFAULT_LLM_TAINT_TEMPLATE_TAIL
 )
 

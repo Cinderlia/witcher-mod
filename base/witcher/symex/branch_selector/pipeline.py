@@ -31,7 +31,7 @@ from common.app_config import append_app_name_to_prompt, get_app_name, load_app_
 from llm_utils import get_default_client
 from llm_utils.taint.taint_llm_calls import LLMCallFailure, chat_text_with_retries, write_llm_failure_artifact
 
-from branch_selector.core.buffer import PromptBuffer
+from branch_selector.core.buffer import PromptBuffer, estimate_tokens
 from branch_selector.core.config import load_config
 from branch_selector.core.scope_folding import ScopeSubsetFolder
 from branch_selector.prompt.llm_response import extract_llm_json_text, parse_llm_response, llm_response_has_valid_json
@@ -1552,6 +1552,7 @@ async def _flush_buffer(
     llm_call_index: int,
     analyze_sem: asyncio.Semaphore,
     analyze_tasks: set,
+    buffer_token_limit: int,
     if_loc_by_seq: Optional[Dict[int, Tuple[str, int]]] = None,
     remaining_seeds: int = 0,
     emit_items: Optional[List[dict]] = None,
@@ -1575,9 +1576,8 @@ async def _flush_buffer(
     app_cfg_debug = None
     try:
         app_cfg_debug = load_symex_app_config()
-        prompt_text = append_app_name_to_prompt(prompt_text, app_cfg_debug)
     except Exception:
-        pass
+        app_cfg_debug = None
     if logger is not None:
         app_line = ""
         app_name = ""
@@ -1585,7 +1585,7 @@ async def _flush_buffer(
         try:
             app_name = get_app_name(app_cfg_debug)
             cfg_path = str(getattr(app_cfg_debug, "config_path", "") or "")
-            app_line = "下面的代码来自" + app_name if app_name else ""
+            app_line = "The following code comes from " + app_name if app_name else ""
         except Exception:
             app_name = ""
             cfg_path = ""
@@ -1674,6 +1674,13 @@ async def _flush_buffer(
     if logger is not None:
         logger.info("llm_call_start", prompt_index=llm_call_index, sections=len(sections), test_mode=bool(test_mode))
     ppath = write_prompt_text(prompt_out_dir, f"{prompt_prefix}{llm_call_index}.txt", prompt_text, logger=logger)
+    mode_name = "if"
+    if sql_mode:
+        mode_name = "sql"
+    elif xss_mode:
+        mode_name = "xss"
+    elif cmd_mode:
+        mode_name = "cmd"
     _write_flush_debug_state(
         logger=logger,
         prompt_prefix=prompt_prefix,
@@ -2350,6 +2357,7 @@ async def run_pipeline(
             llm_call_index=prompt_index,
             analyze_sem=analyze_sem,
             analyze_tasks=pending_analyze_tasks,
+            buffer_token_limit=int(cfg.buffer_token_limit),
             if_loc_by_seq=if_loc_by_seq,
             remaining_seeds=int(remaining_seeds),
             emit_items=emit_items,
@@ -2394,6 +2402,7 @@ async def run_pipeline(
             llm_call_index=prompt_index,
             analyze_sem=analyze_sem,
             analyze_tasks=pending_analyze_tasks,
+            buffer_token_limit=int(cfg.sql_buffer_token_limit),
             if_loc_by_seq=if_loc_by_seq,
             remaining_seeds=int(remaining_seeds),
             emit_items=emit_items,
@@ -2438,6 +2447,7 @@ async def run_pipeline(
             llm_call_index=prompt_index,
             analyze_sem=analyze_sem,
             analyze_tasks=pending_analyze_tasks,
+            buffer_token_limit=int(cfg.xss_buffer_token_limit),
             if_loc_by_seq=if_loc_by_seq,
             remaining_seeds=int(remaining_seeds),
             emit_items=emit_items,
@@ -2482,6 +2492,7 @@ async def run_pipeline(
             llm_call_index=prompt_index,
             analyze_sem=analyze_sem,
             analyze_tasks=pending_analyze_tasks,
+            buffer_token_limit=int(cfg.cmd_buffer_token_limit),
             if_loc_by_seq=if_loc_by_seq,
             remaining_seeds=int(remaining_seeds),
             emit_items=emit_items,
@@ -2574,12 +2585,14 @@ async def run_pipeline(
             if item is done_sentinel:
                 for emit in folder.flush():
                     sec = format_section(int(emit.get("seq")), emit.get("lines") or [], mark_seqs=emit.get("mark_seqs"), logger=logger)
-                    sec_text = build_prompt(sections=[sec], separator="====", base_prompt=cfg.base_prompt, logger=logger)
-                    if not slot["buffer"].can_add(sec_text) and slot["sections"]:
+                    candidate_sections = list(slot["sections"]) + [sec]
+                    candidate_prompt = build_prompt(sections=candidate_sections, separator="====", base_prompt=cfg.base_prompt, logger=logger)
+                    if slot["sections"] and int(estimate_tokens(candidate_prompt)) > int(cfg.buffer_token_limit):
                         await _dispatch_slot(slot)
                         slot = await available_slots.get()
+                        candidate_sections = list(slot["sections"]) + [sec]
+                        candidate_prompt = build_prompt(sections=candidate_sections, separator="====", base_prompt=cfg.base_prompt, logger=logger)
                     slot["sections"].append(sec)
-                    slot["buffer"].add(sec, sec_text)
                 if slot["sections"]:
                     await _dispatch_slot(slot)
                 else:
@@ -2597,12 +2610,14 @@ async def run_pipeline(
             emits = folder.push(item)
             for emit in emits:
                 sec = format_section(int(emit.get("seq")), emit.get("lines") or [], mark_seqs=emit.get("mark_seqs"), logger=logger)
-                sec_text = build_prompt(sections=[sec], separator="====", base_prompt=cfg.base_prompt, logger=logger)
-                if not slot["buffer"].can_add(sec_text) and slot["sections"]:
+                candidate_sections = list(slot["sections"]) + [sec]
+                candidate_prompt = build_prompt(sections=candidate_sections, separator="====", base_prompt=cfg.base_prompt, logger=logger)
+                if slot["sections"] and int(estimate_tokens(candidate_prompt)) > int(cfg.buffer_token_limit):
                     await _dispatch_slot(slot)
                     slot = await available_slots.get()
+                    candidate_sections = list(slot["sections"]) + [sec]
+                    candidate_prompt = build_prompt(sections=candidate_sections, separator="====", base_prompt=cfg.base_prompt, logger=logger)
                 slot["sections"].append(sec)
-                slot["buffer"].add(sec, sec_text)
         exit_state["if_done"] = True
         logger.info("consumer_done", kind="if")
 
@@ -2615,12 +2630,14 @@ async def run_pipeline(
             if item is done_sentinel:
                 for emit in folder.flush():
                     sec = format_sql_section(int(emit.get("seq")), emit.get("lines") or [], mark_seqs=emit.get("mark_seqs"), logger=logger)
-                    sec_text = build_sql_prompt(sections=[sec], separator="====", base_prompt="", logger=logger)
-                    if not slot["buffer"].can_add(sec_text) and slot["sections"]:
+                    candidate_sections = list(slot["sections"]) + [sec]
+                    candidate_prompt = build_sql_prompt(sections=candidate_sections, separator="====", base_prompt="", logger=logger)
+                    if slot["sections"] and int(estimate_tokens(candidate_prompt)) > int(cfg.sql_buffer_token_limit):
                         await _dispatch_sql_slot(slot)
                         slot = await sql_available_slots.get()
+                        candidate_sections = list(slot["sections"]) + [sec]
+                        candidate_prompt = build_sql_prompt(sections=candidate_sections, separator="====", base_prompt="", logger=logger)
                     slot["sections"].append(sec)
-                    slot["buffer"].add(sec, sec_text)
                 if slot["sections"]:
                     await _dispatch_sql_slot(slot)
                 else:
@@ -2638,12 +2655,14 @@ async def run_pipeline(
             emits = folder.push(item)
             for emit in emits:
                 sec = format_sql_section(int(emit.get("seq")), emit.get("lines") or [], mark_seqs=emit.get("mark_seqs"), logger=logger)
-                sec_text = build_sql_prompt(sections=[sec], separator="====", base_prompt="", logger=logger)
-                if not slot["buffer"].can_add(sec_text) and slot["sections"]:
+                candidate_sections = list(slot["sections"]) + [sec]
+                candidate_prompt = build_sql_prompt(sections=candidate_sections, separator="====", base_prompt="", logger=logger)
+                if slot["sections"] and int(estimate_tokens(candidate_prompt)) > int(cfg.sql_buffer_token_limit):
                     await _dispatch_sql_slot(slot)
                     slot = await sql_available_slots.get()
+                    candidate_sections = list(slot["sections"]) + [sec]
+                    candidate_prompt = build_sql_prompt(sections=candidate_sections, separator="====", base_prompt="", logger=logger)
                 slot["sections"].append(sec)
-                slot["buffer"].add(sec, sec_text)
         exit_state["sql_done"] = True
         logger.info("consumer_done", kind="sql")
 
@@ -2656,12 +2675,14 @@ async def run_pipeline(
             if item is done_sentinel:
                 for emit in folder.flush():
                     sec = format_xss_section(int(emit.get("seq")), emit.get("lines") or [], mark_seqs=emit.get("mark_seqs"), logger=logger)
-                    sec_text = build_xss_prompt(sections=[sec], separator="====", base_prompt="", logger=logger)
-                    if not slot["buffer"].can_add(sec_text) and slot["sections"]:
+                    candidate_sections = list(slot["sections"]) + [sec]
+                    candidate_prompt = build_xss_prompt(sections=candidate_sections, separator="====", base_prompt="", logger=logger)
+                    if slot["sections"] and int(estimate_tokens(candidate_prompt)) > int(cfg.xss_buffer_token_limit):
                         await _dispatch_xss_slot(slot)
                         slot = await xss_available_slots.get()
+                        candidate_sections = list(slot["sections"]) + [sec]
+                        candidate_prompt = build_xss_prompt(sections=candidate_sections, separator="====", base_prompt="", logger=logger)
                     slot["sections"].append(sec)
-                    slot["buffer"].add(sec, sec_text)
                 if slot["sections"]:
                     await _dispatch_xss_slot(slot)
                 else:
@@ -2679,12 +2700,14 @@ async def run_pipeline(
             emits = folder.push(item)
             for emit in emits:
                 sec = format_xss_section(int(emit.get("seq")), emit.get("lines") or [], mark_seqs=emit.get("mark_seqs"), logger=logger)
-                sec_text = build_xss_prompt(sections=[sec], separator="====", base_prompt="", logger=logger)
-                if not slot["buffer"].can_add(sec_text) and slot["sections"]:
+                candidate_sections = list(slot["sections"]) + [sec]
+                candidate_prompt = build_xss_prompt(sections=candidate_sections, separator="====", base_prompt="", logger=logger)
+                if slot["sections"] and int(estimate_tokens(candidate_prompt)) > int(cfg.xss_buffer_token_limit):
                     await _dispatch_xss_slot(slot)
                     slot = await xss_available_slots.get()
+                    candidate_sections = list(slot["sections"]) + [sec]
+                    candidate_prompt = build_xss_prompt(sections=candidate_sections, separator="====", base_prompt="", logger=logger)
                 slot["sections"].append(sec)
-                slot["buffer"].add(sec, sec_text)
         exit_state["xss_done"] = True
         logger.info("consumer_done", kind="xss")
 
@@ -2697,12 +2720,14 @@ async def run_pipeline(
             if item is done_sentinel:
                 for emit in folder.flush():
                     sec = format_cmd_section(int(emit.get("seq")), emit.get("lines") or [], mark_seqs=emit.get("mark_seqs"), logger=logger)
-                    sec_text = build_cmd_prompt(sections=[sec], separator="====", base_prompt="", logger=logger)
-                    if not slot["buffer"].can_add(sec_text) and slot["sections"]:
+                    candidate_sections = list(slot["sections"]) + [sec]
+                    candidate_prompt = build_cmd_prompt(sections=candidate_sections, separator="====", base_prompt="", logger=logger)
+                    if slot["sections"] and int(estimate_tokens(candidate_prompt)) > int(cfg.cmd_buffer_token_limit):
                         await _dispatch_cmd_slot(slot)
                         slot = await cmd_available_slots.get()
+                        candidate_sections = list(slot["sections"]) + [sec]
+                        candidate_prompt = build_cmd_prompt(sections=candidate_sections, separator="====", base_prompt="", logger=logger)
                     slot["sections"].append(sec)
-                    slot["buffer"].add(sec, sec_text)
                 if slot["sections"]:
                     await _dispatch_cmd_slot(slot)
                 else:
@@ -2721,6 +2746,7 @@ async def run_pipeline(
             for emit in emits:
                 sec = format_cmd_section(int(emit.get("seq")), emit.get("lines") or [], mark_seqs=emit.get("mark_seqs"), logger=logger)
                 sec_text = build_cmd_prompt(sections=[sec], separator="====", base_prompt="", logger=logger)
+                sec["_debug_single_prompt_text"] = sec_text
                 if not slot["buffer"].can_add(sec_text) and slot["sections"]:
                     await _dispatch_cmd_slot(slot)
                     slot = await cmd_available_slots.get()

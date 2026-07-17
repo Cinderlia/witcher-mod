@@ -397,7 +397,7 @@ def _apply_branch_tag(code: str, branch_tag: str) -> str:
         return code_s
     if _is_if_like_code(code_s):
         return f"[{tag}] {code_s}"
-    return f"{code_s}    # 当前分支方向: {tag}"
+    return f"{code_s}    # Current branch direction: {tag}"
 
 
 def extract_db_search_source_from_prompt_text(prompt_text: str, *, target_seq: Optional[int] = None) -> Dict[str, str]:
@@ -422,10 +422,10 @@ def extract_db_search_source_from_prompt_text(prompt_text: str, *, target_seq: O
                 return idx
         return -1
 
-    env_idx = _find_line("本次执行的环境变量是：")
-    input_idx = _find_line("本次执行的输入是：")
-    context_idx = _find_line("代码上下文（每行：seq | path:line | code）：")
-    constraint_idx = _find_line("仅基于给出的代码和if语句进行符号化， 不允许引入任何未在代码中出现的条件、比较、隐含判断。")
+    env_idx = _find_line("Environment variables for this execution:")
+    input_idx = _find_line("Input for this execution:")
+    context_idx = _find_line("Code context (each line: seq | path:line | code):")
+    constraint_idx = _find_line("Symbolic execution must be based solely on the provided code and if statements. Do not introduce any conditions, comparisons, or implicit assumptions that are not present in the code.")
 
     if env_idx >= 0:
         env_end = input_idx if input_idx > env_idx else len(lines)
@@ -501,24 +501,33 @@ def extract_symbolic_objective_from_prompt_text(prompt_text: str, *, target_seq:
     lines = [str(x or "").strip() for x in str(prompt_text or "").splitlines()]
     seq_text = str(int(target_seq)) if target_seq is not None else ""
     objective_lines: List[str] = []
+    objective_prefixes = [
+        f"If line {seq_text}" if seq_text else "",
+        "Only flip",
+        "Only reverse",
+        "Only modify",
+        "Switch statement:",
+        "switch statement:",
+    ]
+    continuation_keywords = ("branch", "case", "target")
     for line in lines:
         if not line:
             if objective_lines:
                 break
             continue
-        if line.startswith("下面的代码来自"):
+        if line.startswith("The following code comes from "):
             break
-        if line.startswith("本次执行的环境变量是："):
+        if line.startswith("Environment variables for this execution:"):
             break
-        if line.startswith("代码上下文（每行：seq | path:line | code）："):
+        if line.startswith("Code context (each line: seq | path:line | code):"):
             break
-        if seq_text and seq_text + "行" in line:
+        if seq_text and (seq_text + " line") in line:
             objective_lines.append(line)
             continue
-        if line.startswith("如果" + seq_text + "行") or line.startswith("仅反转") or line.startswith("仅修改") or line.startswith("switch语句："):
+        if any(prefix and line.startswith(prefix) for prefix in objective_prefixes):
             objective_lines.append(line)
             continue
-        if objective_lines and ("分支" in line or "case" in line or "目标" in line):
+        if objective_lines and any(keyword in line for keyword in continuation_keywords):
             objective_lines.append(line)
             continue
     return "\n".join([x for x in objective_lines if x]).strip()
@@ -993,48 +1002,49 @@ def generate_symbolic_execution_prompt(
             desired_target_branch = "true"
 
     lines: List[str] = []
-    target_stmt = "if语句"
+    target_stmt = "if statement"
     if switch_case_line_map:
-        target_stmt = "switch语句"
+        target_stmt = "switch statement"
     switch_mode = bool(switch_case_line_map)
     if switch_mode:
         lines.append(
-            "请你根据代码上下文，严格按照符号执行的一般流程，将"
+            "Please follow the general workflow of symbolic execution based on the code context. Symbolically execute the switch statement at line "
             + seq_display
-            + "行的switch语句和它之前所有相关的if语句的条件表达式符号化，使用外部输入的表达式来表示，形成符号执行中的约束。然后求解这些约束表达式，请修改环境变量和输入，给我能够进入所有未被覆盖到的case分支的外部输入。if语句的前面标注了当前的分支走向。"
+            + " and all preceding relevant if statement conditional expressions, representing them using external input expressions to form constraints. Then solve these constraint expressions. Please modify environment variables and inputs to produce external inputs that can reach all uncovered case branches. The if statements are prefixed with the current branch direction."
         )
-        lines.append("switch语句：根据case覆盖情况，生成进入未覆盖case的输入，case前标注false代表未覆盖。")
+        lines.append("Switch statement: Based on case coverage, generate inputs to reach uncovered cases. A case prefixed with false indicates it is uncovered.")
         lines.append(
-            "仅修改"
+            "Only modify the switch statement at line "
             + seq_display
-            + "行的switch语句。"
+            + "."
         )
     else:
         lines.append(
-            "请你根据代码上下文，严格按照符号执行的一般流程，将"
+            "Please follow the general workflow of symbolic execution based on the code context. Symbolically execute the if statement at line "
             + seq_display
-            + "行的if语句和它之前所有相关的if语句的条件表达式符号化，使用外部输入的表达式来表示，形成符号执行中的约束。然后求解这些约束表达式，请修改环境变量和输入，给我一个能够让代码走向if语句另一个方向的外部输入。if语句代码行前面的[true]/[false]标注表示当前这次执行实际走到的分支方向，不是目标方向。"
+            + " and all preceding relevant if statement conditional expressions, representing them using external input expressions to form constraints. Then solve these constraint expressions. Please modify environment variables and inputs to provide an external input that makes the code take the opposite direction of the if statement. The [true]/[false] prefix on the if statement line indicates the branch direction actually taken in the current execution, not the target direction."
         )
-        lines.append("非必要的话，不要随意修改无关的环境变量和输入值，以确保代码能够执行到目标分支。")
+        lines.append("Unless necessary, do not arbitrarily modify unrelated environment variables or input values, to ensure the code can reach the target branch.")
         if current_target_branch and desired_target_branch:
             lines.append(
-                seq_display
-                + "行当前实际执行方向是"
+                "The current actual execution direction of line "
+                + seq_display
+                + " is "
                 + current_target_branch
-                + "，你这次的目标是让这一行改走"
+                + ". Your goal this time is to make it take the "
                 + desired_target_branch
-                + "分支。"
+                + " branch."
             )
         else:
             lines.append(
-                "如果"
+                "If line "
                 + seq_display
-                + "行前面标注为[true]，表示当前实际执行到了true分支，你的目标是让它改走false分支；如果标注为[false]，则目标是让它改走true分支。"
+                + " is prefixed with [true], it means the true branch was actually taken, and your goal is to make it take the false branch. If prefixed with [false], your goal is to make it take the true branch."
             )
         lines.append(
-            "仅反转"
+            "Only reverse the if statement at line "
             + seq_display
-            + "行的if语句。"
+            + "."
         )
     try:
         app_line = build_app_name_prompt_line(load_symex_app_config())
@@ -1055,7 +1065,7 @@ def generate_symbolic_execution_prompt(
         seed_block=seed_block,
         input_value_mask_notice=INPUT_VALUE_MASK_NOTICE,
     )
-    lines.append("代码上下文（每行：seq | path:line | code）：")
+    lines.append("Code context (each line: seq | path:line | code):")
     try:
         from llm_utils.prompts.structured_context import structure_mapped_context
     except Exception:
@@ -1158,41 +1168,41 @@ def generate_symbolic_execution_prompt(
     for item in contiguous_dedup_items:
         lines.append(f"{item['seq_s']} | {item['loc']} | {item['code_s']}")
     lines.append("")
-    lines.append("仅基于给出的代码和if语句进行符号化， 不允许引入任何未在代码中出现的条件、比较、隐含判断。")
-    lines.append("允许使用通用工程先验（如数据库 NOT NULL、INSERT 失败条件、协议规范）来推断哪些修改“在现实系统中高度可能”影响分支结果，但不允许假设具体 schema、字段长度或隐藏代码")
-    lines.append("如果无法确定参数名称的具体格式，根据先验知识尝试生成所有可能的参数格式。")
-    lines.append("如果有多个方案，都可以实现反转，仅输出其中一个。如果你不能确定该方案是否有效，可以输出多个方案。")
+    lines.append("Symbolic execution must be based solely on the provided code and if statements. Do not introduce any conditions, comparisons, or implicit assumptions that are not present in the code.")
+    lines.append("General engineering priors (e.g., database NOT NULL, INSERT failure conditions, protocol specifications) may be used to infer which modifications are 'highly likely' to affect branch outcomes in real-world systems. However, do not assume specific schemas, field lengths, or hidden code.")
+    lines.append("If the exact format of a parameter name cannot be determined, generate all possible parameter formats based on prior knowledge.")
+    lines.append("If multiple approaches can achieve the inversion, output only one of them. If you are unsure whether a given approach is valid, you may output multiple approaches.")
     flags = load_symbolic_seed_kind_flags()
     disabled_types = [key for key in ("POST", "GET", "COOKIE", "SESSION", "ENV", "SQL", "FILE") if not bool(flags.get(key, True))]
     enabled_http_fields = [name for name in ("ENV", "POST", "COOKIE", "GET", "SESSION") if bool(flags.get(name, True))]
-    lines.append("请根据需求修改PHP请求的环境变量、POST、COOKIE、GET、SESSION参数（对应 JSON 字段：ENV/POST/COOKIE/GET/SESSION）。只输出需要修改的键和值，不要把未修改的部分原样抄回 JSON。下游会基于当前输入做增量合并。")
+    lines.append("Please modify the PHP request environment variables, POST, COOKIE, GET, and SESSION parameters as needed. Only output the keys and values that need to be modified. Do not copy back the unchanged parts of the JSON.")
     if enabled_http_fields:
-        lines.append("当前允许输出的请求/环境字段只有：" + "/".join(enabled_http_fields) + "。")
+        lines.append("Only the following request fields are allowed to be modified: " + "/".join(enabled_http_fields))
     else:
-        lines.append("当前 ENV/POST/COOKIE/GET/SESSION 全部被禁用，solutions 中不要输出这些字段。")
-    lines.append("倾向于输出复数个解决方案，每个解决方案对应一个可能的输入值组合，而不是把所有可能的输入值修改都写在一个解决方案里。")
+        lines.append("All ENV/POST/COOKIE/GET/SESSION fields are currently disabled. Do not output these fields in solutions.")
+    lines.append("Prefer outputting multiple solutions, each corresponding to one possible input value combination, rather than placing all possible input value modifications into a single solution.")
     if bool(flags.get("SQL", True)):
-        lines.append("如果仅靠当前外部输入无法稳定求解，而你需要额外的数据库信息，或者需要通过修改数据库状态来反转当前目标语句，请在 solutions 数组中的某个对象里输出 DB_REQUEST 字段。")
-        lines.append('DB_REQUEST 必须是一个 JSON 对象，至少包含以下字段：mode、goal、reason。mode 只能是 "lookup"、"mutation"、"either" 之一。')
-        lines.append("reason 需要说明为什么只改当前 ENV/POST/COOKIE/GET/SESSION 还不够，为什么必须借助数据库信息或数据库修改，才能稳定反转目标语句。")
+        lines.append("If the current external inputs alone cannot reliably satisfy the branch, and you need additional database information or need to modify the database state to invert the target statement, include a DB_REQUEST field in one of the objects in the solutions array.")
+        lines.append('The DB_REQUEST must be a JSON object containing at least the following fields: mode, goal, reason. The mode must be one of: "lookup", "mutation", or "either".')
+        lines.append("The reason must explain why modifying the current ENV/POST/COOKIE/GET/SESSION alone is insufficient, and why database information or database modification is necessary to reliably invert the target statement.")
     else:
-        lines.append("SQL 类型已被禁用：不要输出 DB_REQUEST、DB_QUERY、SQL，也不要建议通过数据库查询或数据库状态修改来求解。")
-    lines.append("如果缺少部分信息，尽量根据代码中的变量名和你的工程先验执行推断外部输入的格式，生成一些可能的输入值。不要输出空json。")
-    lines.append("只输出JSON，不要输出任何解释性文字或Markdown。")
+        lines.append("SQL type is disabled: do not output DB_REQUEST, DB_QUERY, or SQL, and do not suggest solving via database queries or database state modifications.")
     if bool(flags.get("SESSION", True)):
-        lines.append("如果需要修改SESSION参数，请在JSON的 SESSION 字段中输出你想修改的 session 键值对，格式与 POST/GET 类似。")
+        lines.append("If SESSION parameters need to be modified, output the session key-value pairs in the SESSION field of the JSON, using the same format as POST/GET.")
     if bool(flags.get("FILE", True)):
-        lines.append("支持两类文件相关外部输入，并且文件内容一律使用 Base64。不要把二进制原文直接写进 POST/GET/COOKIE/SESSION。")
-        lines.append("第一类：直接上传文件。如果某个 POST/GET/COOKIE/ENV/SESSION 键本身代表上传文件，请把该键的值设置为固定文件占位标记 __WITCHER_FILE_PAYLOAD__ ，并在同一个 solution 里输出顶层字段 __WITCHER_FILE_PAYLOADS__。")
-        lines.append("__WITCHER_FILE_PAYLOADS__ 必须是 JSON 对象，键名就是外部输入里的那个字段名；值是文件描述对象，至少包含 filename、content_base64，可选 content_type。")
-        lines.append("第二类：外部输入里传递的是文件路径。如果某个 POST/GET/COOKIE/ENV/SESSION 键需要的是文件路径，请把该键的值设置为固定路径占位标记 __WITCHER_FILE_PATH__:<file_key> ，其中 <file_key> 由你自定义但要和顶层字段 __WITCHER_FILE_PATH_PAYLOADS__ 里的键一致。")
-        lines.append("__WITCHER_FILE_PATH_PAYLOADS__ 必须是 JSON 对象，键为 <file_key>，值是文件描述对象，至少包含 filename、content_base64，可选 content_type。")
+        lines.append("Two types of file-related external inputs are supported. File content must always be Base64-encoded. Do not write raw binary data directly into POST/GET/COOKIE/SESSION.")
+        lines.append("Type 1: Direct file upload. If a POST/GET/COOKIE/ENV/SESSION key itself represents an uploaded file, set its value to the fixed placeholder __WITCHER_FILE_PAYLOAD__, and include a top-level field __WITCHER_FILE_PAYLOADS__ in the same solution.")
+        lines.append("__WITCHER_FILE_PAYLOADS__ must be a JSON object. The keys are the field names from the external input; the values are file description objects containing at least filename and content_base64, with content_type optional.")
+        lines.append("Type 2: File path passed in external input. If a POST/GET/COOKIE/ENV/SESSION key expects a file path, set its value to the fixed path placeholder __WITCHER_FILE_PATH__:<file_key>, where <file_key> is defined by you and must match the corresponding key in the top-level field __WITCHER_FILE_PATH_PAYLOADS__.")
+        lines.append("__WITCHER_FILE_PATH_PAYLOADS__ must be a JSON object. The keys are <file_key> values, and the values are file description objects containing at least filename and content_base64, with content_type optional.")
     else:
-        lines.append("FILE 类型已被禁用：不要输出 __WITCHER_FILE_PAYLOAD__、__WITCHER_FILE_PAYLOADS__、__WITCHER_FILE_PATH__:*、__WITCHER_FILE_PATH_PAYLOADS__。")
-    lines.append(f"如果你想删除某个已有键，而不是把它设为 null 或空串，请把该键的值设置为严格等于 {DELETE_KEY_SENTINEL} 的字符串。这个约定同样适用于 ENV/POST/COOKIE/GET/SESSION。")
+        lines.append("FILE type is disabled: do not output __WITCHER_FILE_PAYLOAD__, __WITCHER_FILE_PAYLOADS__, __WITCHER_FILE_PATH__:*, or __WITCHER_FILE_PATH_PAYLOADS__.")
+    lines.append("If some information is missing, infer possible input formats based on variable names in the code and your engineering priors, and generate some plausible input values. Do not output an empty JSON.")
+    lines.append("Output only JSON. Do not output any explanatory text or Markdown.")
+    lines.append(f"If you wish to delete an existing key rather than setting it to null or an empty string, set the value of that key to a string strictly equal to {DELETE_KEY_SENTINEL}. This convention applies equally to ENV/POST/COOKIE/GET/SESSION.")
     if disabled_types:
-        lines.append("额外约束：以下类型已在 symex_config.json 中被禁用，solutions 中严禁出现：" + ", ".join(disabled_types) + "。")
-    lines.append("请输出一个JSON文件，示例：")
+        lines.append("Additional constraint: the following types have been disabled in symex_config.json and must not appear in any solution: " + ", ".join(disabled_types) + ".")
+    lines.append("Please output a JSON file. Example:")
     lines.append("{")
     lines.append('  "solutions": [')
     lines.append("    {")
@@ -1241,13 +1251,13 @@ def generate_symbolic_execution_prompt(
         lines.append("      }")
         lines.append("    },")
     if bool(flags.get("SQL", True)):
-        lines.append("    {")
-        lines.append('      "DB_REQUEST": {')
-        lines.append('        "mode": "lookup",')
-        lines.append('        "goal": "为了让目标 if 改走另一侧分支，需要确认 $_POST[username] 对应的用户记录是否存在，以及该记录中的 role/status 是否会影响该分支判断。",')
-        lines.append('        "reason": "当前代码把分支结果建立在数据库中的用户状态上，仅靠猜测输入值无法稳定求解。"')
-        lines.append("      }")
-        lines.append("    }")
+            lines.append("    {")
+            lines.append('      "DB_REQUEST": {')
+            lines.append('        "mode": "lookup",')
+            lines.append('        "goal": "To make the target if statement take the opposite branch, need to confirm whether the user record corresponding to $_POST[username] exists, and whether the role/status in that record affects the branch decision.",')
+            lines.append('        "reason": "The current code bases the branch outcome on the user state in the database. Guessing input values alone cannot reliably solve this."')
+            lines.append("      }")
+            lines.append("    }")
     else:
         lines.append("    {")
         lines.append('      "GET": {')
@@ -1299,8 +1309,8 @@ def write_symbolic_execution_prompt_from_analysis(
 
 def _build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser()
-    p.add_argument("analysis_output", help="analyze_if_line.py 输出的 JSON 文件路径，或直接输入 seq（例如 52564）")
-    p.add_argument("--out", dest="out_path", default="", help="输出 prompt 文本文件路径")
+    p.add_argument("analysis_output", help="Path to the JSON file output by analyze_if_line.py, or a direct seq (e.g., 52564)")
+    p.add_argument("--out", dest="out_path", default="", help="Output path for the prompt text file")
     p.add_argument("--scope-root", dest="scope_root", default="/app")
     p.add_argument("--trace-index", dest="trace_index_path", default=os.path.join("tmp", "trace_index.json"))
     p.add_argument("--windows-root", dest="windows_root", default=r"D:\files\witcher\app")

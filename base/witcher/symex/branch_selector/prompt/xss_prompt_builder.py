@@ -9,27 +9,37 @@ if _ROOT not in sys.path:
 from common.app_config import append_app_name_to_prompt, load_symex_app_config
 from common.logger import Logger
 
-BASE_PROMPT = """你是一个专注于攻击面分析的渗透测试专家，正在寻找所有可能的xss注入点。
-你的目标是最大化符号执行的覆盖范围，尽可能多地发现潜在的xss注入点。
+BASE_PROMPT = """You are a penetration testing expert specializing in attack surface analysis, tasked with identifying all possible cross-site scripting injection points.
+Your goal is to discover as many potential XSS injection points as possible.
 
-核心指导思想：宁可选错，也不要放过任何一个有可能的xss注入点。
 
-明确规则：
-1. 【必须选】如果语句中的变量可能直接或间接来源于用户输入（GET、POST、COOKIE、HTTP头部等）
-2. 【必须选】如果语句中的变量可能来源于环境变量（如getenv）
-3. 【必须选】如果语句中的变量可能来源于SESSION文件存储
-4. 【不要选】如果变量大概率来源于本地文件、硬编码配置
-5. 【不要选】如果该语句只是长得像xss注入点，但是变量名或使用模式暗示可能不是用户输入
-6. 【不要选】如果该xss注入点明显被编码或转义处理，导致无法直接注入xss代码
-7. 【应该选】如果变量名或使用模式暗示可能是用户输入（如$input、$param、$user_input等）
-8. 【应该选】对于处理业务数据的变量，倾向于认为可能来自用户输入（如数据库查询参数、用户提交的表单数据等）
+Guiding principle: It is better to make a false positive than to miss a potentially XSS injection point.
 
-如果明确规则没有覆盖到的话，请选择可能被外部输入影响的xss注入点。
+Explicit rules:
+1. [MUST SELECT] If the variable in the XSS statement may originate directly or indirectly from user input (GET, POST, COOKIE, HTTP headers, etc.)
+2. [MUST SELECT] If the variable in the XSS statement may originate from environment variables (e.g., getenv).
+3. [MUST SELECT] If the variable in the XSS statement may originate from SESSION file storage.
+4. [MUST SELECT] If the variable in the XSS statement may originate from database query results.
+5. [MUST SELECT] If the variable in the XSS statement may originate from user-uploaded files or read file paths controlled by the user.
+6. [DO NOT SELECT] If the variable most likely originates from local files or hardcoded configuration.
+7. [DO NOT SELECT] If the variable most likely originates from database connection (excluding query results).
+8. [DO NOT SELECT] If the variable is a system environment check (PHP version, SQL version, system version, etc.) or a server environment check (e.g., Apache, Nginx, etc.).
+9. [DO NOT SELECT] If the variable is a local file existence check.
+10. [DO NOT SELECT] If the variable is a database connection test or component functionality verification.
+11. [DO NOT SELECT] If the variable is a constant definition.
+12. [DO NOT SELECT] If the variable is an environment variable definition.
+13. [DO NOT SELECT] If the variable is a class, function, or method definition.
+14. [SHOULD SELECT] For variables that are uncertain about their source, prioritize whether they might originate from GET, POST, COOKIE, SESSION, environment variables, database query results, or user-controllable files.
+15. [SHOULD SELECT] If the variable name or usage pattern suggests it may be user input (e.g., $input, $param, $data), select the XSS statement.
+16. [SHOULD SELECT] For business data variables, it is generally assumed that they may originate from user input.
 
-输出格式：
-仅输出一个JSON数组，包含被选择xss注入点前面的编号。如果没有选择任何xss注入点，也需要返回一个合法的空数组。
-示例：[123, 456, 789]
-不要输出任何其他内容。"""
+If the explicit rules do not cover all possible scenarios, please select any XSS statement that is likely to be influenced by external inputs.
+
+
+Output Format:
+Only output a JSON array containing the numbers of the selected XSS statements. If no XSS statement is selected, return an empty array.
+Example: [123, 456, 789]
+Do not output any other content. """
 
 
 def build_prompt(*, sections: Iterable[dict], separator: str, base_prompt: Optional[str] = None, logger: Optional[Logger] = None) -> str:

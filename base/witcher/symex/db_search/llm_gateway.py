@@ -177,7 +177,7 @@ def _format_filtered_payload_block(title: str, payloads, *, pair_limit: int = 5)
 def _format_schema_memory(state: DBSearchState) -> str:
     lines = []
     if state.schema_findings:
-        lines.append("已确认的 schema 发现：")
+        lines.append("Confirmed schema discoveries:")
         for item in state.schema_findings:
             if item:
                 lines.append("- " + str(item))
@@ -193,7 +193,7 @@ def _format_schema_memory(state: DBSearchState) -> str:
             )
         ]
     payload_block = _format_filtered_payload_block(
-        "之前 schema 查询：",
+        "Previous schema queries:",
         schema_payloads,
         pair_limit=5,
     )
@@ -205,20 +205,20 @@ def _format_schema_memory(state: DBSearchState) -> str:
 def _format_candidate_memory(state: DBSearchState) -> str:
     lines = []
     if state.schema_findings:
-        lines.append("第二轮已经确认的结构结论：")
+        lines.append("Confirmed structural conclusions from the second round:")
         for item in state.schema_findings:
             if item:
                 lines.append("- " + str(item))
         lines.append("")
     schema_payload_block = _format_filtered_payload_block(
-        "第二轮累积筛选出的有效信息：",
+        "Valid information accumulated from the second round:",
         _recent_filtered_payloads(state, PhaseName.SCHEMA_DISCOVERY, limit=8),
         pair_limit=5,
     )
     if schema_payload_block:
         lines.append(schema_payload_block)
     candidate_payload_block = _format_filtered_payload_block(
-        "第三轮当前已累积的有效信息：",
+        "Valid information accumulated so far in the third round:",
         _recent_filtered_payloads(state, PhaseName.CANDIDATE_LOOKUP, limit=8),
         pair_limit=5,
     )
@@ -230,14 +230,14 @@ def _format_candidate_memory(state: DBSearchState) -> str:
 def _format_finalize_memory(state: DBSearchState) -> str:
     lines = []
     context_block = _format_filtered_payload_block(
-        "前两轮数据库信息再次过滤后的有效信息：",
+        "Valid information after re-filtering database information from the first two rounds:",
         state.finalize_context_payloads or [],
         pair_limit=8,
     )
     if context_block:
         lines.append(context_block)
     finalize_payload_block = _format_filtered_payload_block(
-        "第四轮当前已累积的有效信息：",
+        "Valid information accumulated so far in the fourth round:",
         _recent_filtered_payloads(state, PhaseName.FINALIZE, limit=8),
         pair_limit=5,
     )
@@ -248,7 +248,7 @@ def _format_finalize_memory(state: DBSearchState) -> str:
 
 def _format_input_snapshot(snapshot: ExternalInputSnapshot) -> str:
     lines = []
-    lines.append("原始外部输入：")
+    lines.append("Original external input:")
     lines.append("ENV:")
     lines.append(snapshot.raw_env_block or "<EMPTY>")
     lines.append("")
@@ -368,20 +368,20 @@ def build_goal_abstraction_prompt(request: DBSearchRequest, state: DBSearchState
             continue
         visible_notes.append(note_s)
     lines = []
-    lines.append("你是一个数据库辅助符号执行规划器。")
-    lines.append("你的唯一目的，是服务于目标语句的分支方向改变或执行结果改变，而不是做泛化的数据库分析。")
-    lines.append("如果第" + (str(ctx.target_seq) if ctx.target_seq is not None else "?") + "行前面标注为[true]，表示当前实际执行到了true分支，你的目标是让它改走false分支；如果标注为[false]，则目标是让它改走true分支。")
-    lines.append("如果目标语句是 switch，就要帮助它进入当前未覆盖的 case。")
-    lines.append("你的任务是把当前原始代码和外部输入精炼成一个能够指导后续三轮数据库搜索的总目标和每个轮次的子目标。")
-    lines.append("后续组件默认只消费你的抽象结果，所以请在目标描述中包含所有必要的信息，确保后续每一轮都始终围绕目标语句的方向改变来查询、筛选和最终输出。")
-    lines.append("后续三轮的目标不能笼统，必须把当前代码中的关键判断、关键调用、关键变量，以及当前外部输入中的关键键名和值域线索，精炼进目标描述中。")
-    lines.append("后续组件会继续分三轮工作：schema discovery、candidate lookup、finalize/output。")
-    lines.append("你需要分别给出这三轮的目标，但重点是先给出一个足够具体、能直接指导后三轮的 overall_goal。")
-    lines.append("第二轮和第三轮的子目标与停止条件，都应更偏向探索数据库里实际有什么、哪些结构和记录真实存在、哪些查询路径值得继续，而不是只围绕“确认某个猜想是否成立”。")
-    lines.append("停止条件也应偏向“已经获得足够探索结果，足以指导下一轮或最终输出”，而不是机械地要求确认某个表/列/记录有或没有。")
-    lines.append("你必须区分：哪些表/列是从代码中直接看到的，哪些只是根据语义推测出来的。后续轮次需要优先探索“代码中直接看到的”，推测项只能作为次要线索。")
-    lines.append("如果你认为后续需要数据库查询，请明确需要去探索什么信息；如果你认为后续可能需要数据库修改，请明确需要修改哪类数据库项，以及这些动作如何服务于目标语句方向改变。")
-    lines.append("不要输出解释性文字，只输出JSON。")
+    lines.append("You are a database-assisted symbolic execution planner.")
+    lines.append("Your sole purpose is to serve the branch direction change or execution result change of the target statement, not to perform generalized database analysis.")
+    lines.append("If line " + (str(ctx.target_seq) if ctx.target_seq is not None else "?") + " is prefixed with [true], it means the true branch was actually taken, and your goal is to make it take the false branch. If prefixed with [false], your goal is to make it take the true branch.")
+    lines.append("If the target statement is a switch, help it enter a currently uncovered case.")
+    lines.append("Your task is to distill the current raw code and external inputs into an overall goal that can guide the subsequent three rounds of database search, along with sub-goals for each round.")
+    lines.append("Subsequent components will only consume your abstract results, so please include all necessary information in the goal description to ensure that every subsequent round stays focused on the target statement's direction change for queries, filtering, and final output.")
+    lines.append("The goals for the subsequent three rounds must not be vague. Key conditions, key calls, key variables in the current code, as well as key key names and value-domain clues in the current external inputs, must be distilled into the goal description.")
+    lines.append("The subsequent components will continue to work in three rounds: schema discovery, candidate lookup, and finalize/output.")
+    lines.append("You need to specify goals for each of these three rounds, but the priority is to first provide an overall_goal that is specific enough to directly guide the subsequent three rounds.")
+    lines.append("The sub-goals and stopping conditions for the second and third rounds should lean toward exploring what actually exists in the database, which structures and records truly exist, and which query paths are worth pursuing, rather than solely focusing on confirming whether a particular hypothesis is true.")
+    lines.append("Stopping conditions should also lean toward 'sufficient exploration results have been obtained to guide the next round or final output', rather than mechanically requiring confirmation of whether a given table/column/record exists or not.")
+    lines.append("You must distinguish which tables/columns are directly visible in the code and which are only inferred from semantics. Subsequent rounds should prioritize exploring what is directly visible in the code; inferred items may only serve as secondary clues.")
+    lines.append("If you believe database queries will be needed in subsequent rounds, specify what information needs to be explored. If you believe database modifications may be needed, specify what types of database items need to be modified and how these actions serve the target statement's direction change.")
+    lines.append("Do not output explanatory text. Output only JSON.")
     lines.append("")
     try:
         app_line = build_app_name_prompt_line(load_symex_app_config(config_path=request.config_path))
@@ -391,61 +391,61 @@ def build_goal_abstraction_prompt(request: DBSearchRequest, state: DBSearchState
         lines.append(app_line)
         lines.append("")
     if request.trigger_reason and str(request.trigger_reason).strip() != str(request.db_request_reason or "").strip():
-        lines.append("启动数据库搜索组件的原因：")
+        lines.append("Reason for initiating the database search component:")
         lines.append(str(request.trigger_reason))
         lines.append("")
     if request.symbolic_objective:
-        lines.append("symbolic_prompt 传入的主目标：")
+        lines.append("Primary goal passed from symbolic_prompt:")
         lines.append(str(request.symbolic_objective))
         lines.append("")
-    lines.append("数据库搜索的唯一验收标准：")
-    lines.append("所有查询、候选记录判断和最终数据库修改，都必须直接服务于 target_seq/target_loc 对应目标语句的执行结果改变。")
+    lines.append("Sole acceptance criterion for database search:")
+    lines.append("All queries, candidate record evaluations, and final database modifications must directly serve the execution result change of the target statement at target_seq/target_loc.")
     lines.append("")
     if request.db_request_mode or request.db_request_goal or request.db_request_reason or request.db_request_focus:
-        lines.append("主流程给出的数据库辅助请求：")
+        lines.append("Database assistance request from the main workflow:")
         lines.append("mode=" + (request.db_request_mode or "<EMPTY_MODE>"))
         lines.append("goal=" + (request.db_request_goal or "<EMPTY_GOAL>"))
         lines.append("reason=" + (request.db_request_reason or "<EMPTY_REASON>"))
         if request.db_request_focus:
             lines.append("focus=" + json.dumps(list(request.db_request_focus or []), ensure_ascii=False))
         lines.append("")
-    lines.append("目标分支：")
+    lines.append("Target branch:")
     lines.append("target_seq=" + (str(ctx.target_seq) if ctx.target_seq is not None else "?"))
     lines.append("target_loc=" + (ctx.target_loc or "?"))
     lines.append("")
-    lines.append("原始代码切片：")
+    lines.append("Original code slice:")
     lines.append(ctx.code_slice.strip() or "<EMPTY_CODE_SLICE>")
     lines.append("")
     lines.append(_format_input_snapshot(snapshot))
     if visible_notes:
         lines.append("")
-        lines.append("额外说明：")
+        lines.append("Additional notes:")
         for note in visible_notes:
             lines.append("- " + note)
     lines.append("")
-    lines.append("请输出如下JSON：")
+    lines.append("Please output the following JSON:")
     lines.append("{")
-    lines.append('  "overall_goal": "把原始代码条件、外部输入线索和数据库需求精炼后的总目标，必须以反转目标语句为唯一目的，并且足够具体，能直接指导后三轮",')
-    lines.append('  "branch_effect": "目标语句需要发生的执行结果变化，例如让 verify 返回 true、让目标 if 改走 false 分支、或让 switch 进入未覆盖 case",')
-    lines.append('  "db_reason": "为什么需要数据库辅助",')
-    lines.append('  "relevant_symbols": ["与数据库探索有关的关键变量、属性、返回值或谓词"],')
-    lines.append('  "relevant_inputs": ["与数据库探索有关的外部输入键名"],')
-    lines.append('  "schema_goal": "第二轮要优先探索哪些表、列、关联和结构线索，弄清数据库里实际有什么，以及哪些路径值得继续追查",')
-    lines.append('  "candidate_goal": "第三轮要继续探索哪些候选记录、值域、关联路径和失败原因，弄清数据库当前真实内容与可利用空间",')
-    lines.append('  "finalize_goal": "第四轮输出前，哪些数据库事实和求解线索最关键",')
-    lines.append('  "db_information_needs": ["后续需要查询的数据库信息"],')
-    lines.append('  "db_mutation_targets": ["如果最终可能需要写库，描述要修改的数据库项类型"],')
-    lines.append('  "code_seen_tables": ["从代码中直接看到的表名；只能填代码里真的出现过的表"],')
-    lines.append('  "code_seen_columns": ["从代码中直接看到的列名；只能填代码里真的出现过的列"],')
-    lines.append('  "inferred_tables": ["根据语义推测但代码中未直接出现的表名；不确定则留空"],')
-    lines.append('  "inferred_columns": ["根据语义推测但代码中未直接出现的列名；不确定则留空"],')
-    lines.append('  "schema_stop_conditions": ["第二轮何时可以停止，例如已经摸清关键表结构、关键列分布、主要关联路径，或已获得足够信息指导第三轮继续探索"],')
-    lines.append('  "candidate_stop_conditions": ["第三轮何时可以停止，例如已经摸清关键候选记录范围、关键值域、主要失败原因，或已获得足够信息指导第四轮输出"],')
-    lines.append('  "finalize_stop_conditions": ["第四轮何时可以直接输出 solution 或 SQL 修改"],')
-    lines.append('  "evidence": ["支持上述抽象的关键代码证据或输入证据"],')
-    lines.append('  "abstraction_warnings": ["可能导致后续探索失真的风险点，可为空数组"]')
+    lines.append('  "overall_goal": "Overall goal distilled from raw code conditions, external input clues, and database requirements. Must have reversing the target statement as its sole purpose, and must be specific enough to directly guide the subsequent three rounds.",')
+    lines.append('  "branch_effect": "The execution result change that the target statement needs to undergo, e.g., making verify return true, making the target if take the false branch, or making a switch enter an uncovered case.",')
+    lines.append('  "db_reason": "Why database assistance is needed.",')
+    lines.append('  "relevant_symbols": ["Key variables, attributes, return values, or predicates relevant to database exploration."],')
+    lines.append('  "relevant_inputs": ["External input key names relevant to database exploration."],')
+    lines.append('  "schema_goal": "Which tables, columns, relationships, and structural clues to prioritize exploring in the second round. Focus on discovering what actually exists in the database and which paths are worth pursuing further.",')
+    lines.append('  "candidate_goal": "Which candidate records, value ranges, relationship paths, and failure reasons to continue exploring in the third round. Focus on discovering the actual current content of the database and its exploitable space.",')
+    lines.append('  "finalize_goal": "Which database facts and solving clues are most critical before the fourth round output.",')
+    lines.append('  "db_information_needs": ["Database information that needs to be queried in subsequent rounds."],')
+    lines.append('  "db_mutation_targets": ["If database writes may eventually be needed, describe the types of database items to be modified."],')
+    lines.append('  "code_seen_tables": ["Table names directly seen in the code. Only fill in tables that actually appear in the code."],')
+    lines.append('  "code_seen_columns": ["Column names directly seen in the code. Only fill in columns that actually appear in the code."],')
+    lines.append('  "inferred_tables": ["Table names inferred from semantics but not directly seen in the code. Leave empty if uncertain."],')
+    lines.append('  "inferred_columns": ["Column names inferred from semantics but not directly seen in the code. Leave empty if uncertain."],')
+    lines.append('  "schema_stop_conditions": ["When the second round can stop, e.g., key table structures, key column distributions, and main relationship paths have been mapped, or sufficient information has been obtained to guide the third round\'s exploration."],')
+    lines.append('  "candidate_stop_conditions": ["When the third round can stop, e.g., the key candidate record range, key value domains, and main failure reasons have been mapped, or sufficient information has been obtained to guide the fourth round\'s output."],')
+    lines.append('  "finalize_stop_conditions": ["When the fourth round can directly output a solution or SQL modification."],')
+    lines.append('  "evidence": ["Key code evidence or input evidence supporting the above abstractions."],')
+    lines.append('  "abstraction_warnings": ["Risks that may distort subsequent exploration. May be an empty array."]')
     lines.append("}")
-    lines.append("如果某些字段无法确定，保留空字符串、空对象或空数组，但字段必须存在。")
+    lines.append("If some fields cannot be determined, leave them as empty strings, empty objects, or empty arrays, but the fields must exist.")
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -453,176 +453,177 @@ def build_phase_prompt(phase: str, state: DBSearchState) -> str:
     """Build the prompt for one schema/candidate/finalize round."""
     if phase == PhaseName.SCHEMA_DISCOVERY:
         lines = []
-        lines.append("你是数据库辅助符号执行规划器，现在处于数据库搜索组件的第二轮。")
-        lines.append("你的任务是为了实现总目标和当前轮次目标，判断接下来应该查询哪些数据库结构信息，并在信息足够时果断结束本轮。")
-        lines.append("你只能输出两类结果之一：")
-        lines.append("1. 继续查询数据库信息，输出 queries")
-        lines.append("2. 判断当前轮次目标已达成，输出 completed=true 且 queries 为空")
-        lines.append("本轮只允许只读数据库查询。目标更偏结构，应优先使用 DESCRIBE、SHOW COLUMNS、SHOW CREATE TABLE、EXPLAIN、SELECT information_schema 来尽可能快地拿到完整表结构；只有在结构探测后仍需验证假设时，才补充普通只读 SELECT。")
-        lines.append("默认策略应当是尽量用更少轮次收敛，但单轮内要更主动探索，优先争取一次拿到足够信息。")
-        lines.append("本轮查询倾向是探索：尽快找出确切相关表、确切列名、确切 JOIN 路径和关键约束字段，不要停留在“是否存在某张表/有几张表”的确认层面。")
-        lines.append("本轮的任务是：**只查表结构，不查数据内容。** 本轮只回答'这个表有哪些列'，不回答'这个列里有什么数据'。")
-        lines.append("本轮禁止探寻任何业务数据的内容，包括但不限于：")
-        lines.append("- 任何业务数据的记录、值域、关联路径、失败原因等")
-        lines.append("如果当前子目标提到了某个疑似列或疑似关联字段，你应主动设计探测性查询去确认它是否真实存在，而不是把它当成已知事实。")
-        lines.append("优先通过 DESCRIBE / SHOW COLUMNS 获取完整列集合，再决定后续是否需要用 EXPLAIN、information_schema 或小范围 SELECT 验证关联方向。")
-        lines.append("第二轮只要已经摸清总目标真正依赖的表结构，或者已经确认某个关键表/关键列存在或不存在，就可以直接 completed=true。")
-        lines.append("即使当前 schema_goal 没有逐字完成，只要现有信息已经足够服务总目标，或足够判断原目标中的某些表项是错误假设，也可以直接 completed=true。")
-        lines.append("禁止确认低价值细节，禁止确认数据内容和记录，本轮只探索表结构和关联关系。")
-        lines.append("如果还不够，就输出必要的查询。一轮最多输出 5 条 SQL，但应尽量一次查到足够信息。")
-        lines.append("不要输出解释性文字，只输出 JSON。")
+        lines.append("You are a database-assisted symbolic execution planner, now in the second round of the database search component.")
+        lines.append("Your task is to determine which database structural information should be queried next in order to achieve the overall goal and the current round goal, and to decisively end this round when sufficient information has been obtained.")
+        lines.append("You may output only one of two types of results:")
+        lines.append("1. Continue querying database information, output queries")
+        lines.append("2. Determine that the current round goal has been achieved, output completed=true with queries empty")
+        lines.append("This round allows only read-only database queries. The goal leans toward structure, so priority should be given to DESCRIBE, SHOW COLUMNS, SHOW CREATE TABLE, EXPLAIN, and SELECT information_schema to obtain complete table structures as quickly as possible. Only supplement with ordinary read-only SELECT after structural probing when hypotheses still need verification.")
+        lines.append("The default strategy should be to converge in as few rounds as possible, but be more proactive within a single round, prioritizing gathering sufficient information in one go.")
+        lines.append("The query tendency for this round is exploration: quickly identify the exact relevant tables, exact column names, exact JOIN paths, and key constraint fields. Do not stop at the confirmation level of 'whether a table exists or how many tables there are'.")
+        lines.append("The task for this round is: **query only table structures, not data content.** This round only answers 'what columns does this table have', not 'what data is in this column'.")
+        lines.append("This round prohibits probing the content of any business data, including but not limited to:")
+        lines.append("- Any business data records, value ranges, relationship paths, failure reasons, etc.")
+        lines.append("If the current sub-goal mentions a suspected column or suspected relationship field, you should proactively design exploratory queries to confirm whether it actually exists, rather than treating it as known fact.")
+        lines.append("Prefer using DESCRIBE / SHOW COLUMNS to obtain the full column set first, then decide whether to use EXPLAIN, information_schema, or a small-scope SELECT to verify relationship directions.")
+        lines.append("In the second round, as long as the table structures truly depended on by the overall goal have been mapped, or the existence or non-existence of a key table/key column has been confirmed, you may directly set completed=true.")
+        lines.append("Even if the current schema_goal has not been completed verbatim, as long as the existing information is sufficient to serve the overall goal, or sufficient to determine that certain table items in the original goal are incorrect assumptions, you may also directly set completed=true.")
+        lines.append("Do not confirm low-value details. Do not confirm data content or records. This round explores only table structures and relationships.")
+        lines.append("If the information is still insufficient, output the necessary queries. Output at most 5 SQL statements per round, but try to obtain sufficient information in a single query batch.")
+        lines.append("Do not output explanatory text. Output only JSON.")
         lines.append("")
-        lines.append("总目标：")
+        lines.append("Overall goal:")
         lines.append(state.goal.summary or "<EMPTY_OVERALL_GOAL>")
         lines.append("")
-        lines.append("第二轮子目标：")
+        lines.append("Second round sub-goal:")
         lines.append(state.goal.schema_goal or "<EMPTY_SCHEMA_GOAL>")
         lines.append("")
         if state.goal.relevant_symbols:
-            lines.append("关键符号：")
+            lines.append("Key symbols:")
             for item in state.goal.relevant_symbols:
                 lines.append("- " + item)
             lines.append("")
         if state.goal.relevant_inputs:
-            lines.append("关键外部输入：")
+            lines.append("Key external inputs:")
             for item in state.goal.relevant_inputs:
                 lines.append("- " + item)
             lines.append("")
         if state.goal.db_information_needs:
-            lines.append("需要查询的数据库信息：")
+            lines.append("Database information to be queried:")
             for item in state.goal.db_information_needs:
                 lines.append("- " + item)
             lines.append("")
         if state.goal.code_seen_tables:
-            lines.append("代码中直接看到的相关表：")
+            lines.append("Relevant tables directly seen in the code:")
             for item in state.goal.code_seen_tables:
                 lines.append("- " + item)
             lines.append("")
         if state.goal.code_seen_columns:
-            lines.append("代码中直接看到的相关列：")
+            lines.append("Relevant columns directly seen in the code:")
             for item in state.goal.code_seen_columns:
                 lines.append("- " + item)
             lines.append("")
         if state.goal.inferred_tables:
-            lines.append("推测相关表（次要线索）：")
+            lines.append("Inferred relevant tables (secondary clues):")
             for item in state.goal.inferred_tables:
                 lines.append("- " + item)
             lines.append("")
         if state.goal.inferred_columns:
-            lines.append("推测相关列（次要线索）：")
+            lines.append("Inferred relevant columns (secondary clues):")
             for item in state.goal.inferred_columns:
                 lines.append("- " + item)
             lines.append("")
         if state.goal.schema_stop_conditions:
-            lines.append("第二轮可停止条件：")
+            lines.append("Second round stopping conditions:")
             for item in state.goal.schema_stop_conditions:
                 lines.append("- " + item)
             lines.append("")
         if state.goal.evidence:
-            lines.append("关键证据：")
+            lines.append("Key evidence:")
             for item in state.goal.evidence:
                 lines.append("- " + item)
             lines.append("")
         if state.goal.abstraction_warnings:
-            lines.append("抽象风险：")
+            lines.append("Abstraction risks:")
             for item in state.goal.abstraction_warnings:
                 lines.append("- " + item)
             lines.append("")
         schema_memory = _format_schema_memory(state)
         if schema_memory:
             lines.append(schema_memory)
-        lines.append("输出 SQL 时，不需要关心数据库用户、数据库地址和数据库名，直接输出可执行的合法 SQL 语句即可。")
-        lines.append("请输出如下 JSON：")
+        lines.append("")
+        lines.append("When outputting SQL, you do not need to concern yourself with database user, database address, or database name. Simply output executable and valid SQL statements directly.")
+        lines.append("Please output JSON in the following format:")
         lines.append("{")
         lines.append('  "completed": false,')
-        lines.append('  "rationale": "本轮为何继续查询或为何可结束",')
-        lines.append('  "findings": ["本轮已经确认的 schema 结论"],')
+        lines.append('  "rationale": "Why this round continues querying or why it can end",')
+        lines.append('  "findings": ["Schema conclusions confirmed in this round"],')
         lines.append('  "queries": [')
         lines.append("    {")
         lines.append('      "sql": "SHOW COLUMNS FROM candidate_table;",')
-        lines.append('      "purpose": "快速获取候选表的完整列集合，确认关键字段是否存在",')
-        lines.append('      "metadata": {"kind": "schema_probe", "probe_target": "candidate_table", "probe_action": "describe_table", "verify_column": "candidate_column", "goal": "确认疑似关键字段是否存在并获取完整表结构"}')
+        lines.append('      "purpose": "Quickly obtain the full column set of the candidate table to confirm whether key fields exist",')
+        lines.append('      "metadata": {"kind": "schema_probe", "probe_target": "candidate_table", "probe_action": "describe_table", "verify_column": "candidate_column", "goal": "Confirm whether the suspected key field exists and obtain the complete table structure"}')
         lines.append("    },")
         lines.append("    {")
         lines.append('      "sql": "SHOW CREATE TABLE candidate_table;",')
-        lines.append('      "purpose": "获取候选表的建表语句，补充索引、键与约束信息",')
-        lines.append('      "metadata": {"kind": "schema_probe", "probe_target": "candidate_table", "probe_action": "show_create_table", "goal": "补充完整表结构与约束信息"}')
+        lines.append('      "purpose": "Obtain the CREATE TABLE statement for the candidate table to supplement index, key, and constraint information",')
+        lines.append('      "metadata": {"kind": "schema_probe", "probe_target": "candidate_table", "probe_action": "show_create_table", "goal": "Supplement complete table structure and constraint information"}')
         lines.append("    },")
         lines.append("    {")
         lines.append('      "sql": "SELECT COLUMN_NAME, TABLE_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND COLUMN_NAME IN (\'candidate_column\', \'join_column\');",')
-        lines.append('      "purpose": "跨表探测关键列出现位置，辅助确认关联路径",')
-        lines.append('      "metadata": {"kind": "schema_probe", "probe_target": "information_schema", "probe_action": "cross_table_column_lookup", "verify_columns": ["candidate_column", "join_column"], "goal": "确认关键字段实际位于哪些表"}')
+        lines.append('      "purpose": "Cross-table probe for key column occurrences to assist in confirming relationship paths",')
+        lines.append('      "metadata": {"kind": "schema_probe", "probe_target": "information_schema", "probe_action": "cross_table_column_lookup", "verify_columns": ["candidate_column", "join_column"], "goal": "Confirm which tables actually contain the key fields"}')
         lines.append("    }")
         lines.append("  ]")
         lines.append("}")
-        lines.append("如果已经达到当前轮次目标，则设置 completed=true，并让 queries 为空数组。")
-        lines.append("如果还未达到当前轮次目标，则设置 completed=false，并输出 queries。")
-        lines.append("schema discovery 阶段的 metadata.kind 应优先使用 schema_probe，而不是只有笼统的 schema。")
-        lines.append("当你在验证某个疑似列/疑似关联字段是否存在时，请在 metadata 中明确写出 verify_column 或 verify_columns；当你在探测某张表完整结构时，请把 probe_action 设为 describe_table。")
-        lines.append("queries 最多 5 条，且都必须是只读数据库查询。")
+        lines.append("If the current round goal has been achieved, set completed=true and leave queries as an empty array.")
+        lines.append("If the current round goal has not yet been achieved, set completed=false and output queries.")
+        lines.append("During the schema discovery phase, metadata.kind should prefer schema_probe rather than a generic schema label.")
+        lines.append("When you are verifying whether a suspected column or suspected relationship field exists, explicitly include verify_column or verify_columns in metadata. When you are probing the complete structure of a table, set probe_action to describe_table.")
+        lines.append("queries is limited to a maximum of 5 entries, and all must be read-only database queries.")
         return "\n".join(lines).rstrip() + "\n"
     if phase == PhaseName.CANDIDATE_LOOKUP:
         fallback_allowed = _candidate_fallback_available(state)
         lines = []
-        lines.append("你是数据库辅助符号执行探索器，现在处于数据库搜索组件的第三轮。")
-        lines.append("你的任务是为了实现总目标和当前轮次目标，查找可复用的候选记录，或判断现有数据库内容无法直接满足目标，并在证据足够时果断结束本轮。")
-        lines.append("你只能输出以下选项中的一个：")
-        lines.append("1. 继续查询数据库内容，输出 queries")
-        lines.append("2. 当前轮次目标已完成，输出 completed=true 且 queries 为空")
+        lines.append("You are a database-assisted symbolic execution explorer, now in the third round of the database search component.")
+        lines.append("Your task is to find reusable candidate records in order to achieve the overall goal and the current round goal, or to determine that the existing database content cannot directly satisfy the goal, and to decisively end this round when sufficient evidence has been obtained.")
+        lines.append("You may output only one of the following options:")
+        lines.append("1. Continue querying database content, output queries")
+        lines.append("2. The current round goal has been completed, output completed=true with queries empty")
         if fallback_allowed:
-            lines.append("3. 当前仍缺少额外的结构信息，必须回退到第二轮，输出 request_schema_fallback=true 且 queries 为空")
+            lines.append("3. Additional structural information is still missing and a fallback to the second round is required, output request_schema_fallback=true with queries empty")
 
-        lines.append("本轮只允许只读数据库查询，重点围绕目标查找可直接复用或验证失败原因的候选记录。禁止使用任何业务数据上的 INSERT、UPDATE、DELETE 等语句对数据库进行修改。")
-        lines.append("你的默认策略应当是尽量用更少轮次收敛，但单轮内要更主动探索，优先争取一次拿到足够信息。")
-        lines.append("本轮查询倾向同样是探索：确认确切候选记录、确切约束字段、确切列名和值域来源，不要停留在模糊确认层面。")
-        lines.append("在构造任何查询之前，先检查本轮已获得的结构信息（如 DESCRIBE 结果）。")
-        lines.append("优先使用不容易报错的查询语句，在获取到足够信息后，再考虑使用更复杂的查询语句。")
-        lines.append("查询策略是先使用宽泛查询获取全貌，再逐步收窄，确定后续记录。禁止在没查清楚数据分布之前，就尝试复杂的关联查询。禁止使用不确定的列名做 JOIN 操作。")
-        lines.append("只使用已确认存在的表名和列名，如果某列在结构信息中未出现，不要假设它存在。")
-        lines.append("如果查询返回字段不存在的报错，后续查询不再使用该列，如果一条查询路径因结构不匹配而失败，切换到其他可用路径。")
-        lines.append("不要在同一路径上反复尝试不同写法——结构错误不会因写法改变而消失。")
-        lines.append("第三轮只要已经找到足以支持最终构造 solution 的候选记录，或者已经有足够证据说明当前数据库内容无法直接满足目标，就直接 completed=true。")
-        lines.append("即使当前 candidate_goal 没有逐字完成，只要现有信息已经足够服务总目标、足够支撑第四轮输出，或足够证明原先的候选假设不成立，也可以直接 completed=true。")
-        lines.append("不要为了补齐低价值背景信息而继续查询；但如果还缺少会影响最终构造的关键字段/关键记录，应在同一轮尽量补齐。")
-        lines.append("如果需要继续查询，就输出必要的查询语句，一次最多输出 5 条 SQL；应尽量在同一轮把关键探索信息查够。")
-        lines.append("不要输出解释性文字，只输出 JSON。")
+        lines.append("This round allows only read-only database queries, with a focus on finding candidate records that can be directly reused or that explain failure reasons. Any business data modifications such as INSERT, UPDATE, DELETE are strictly prohibited.")
+        lines.append("Your default strategy should be to converge in as few rounds as possible, but be more proactive within a single round, prioritizing gathering sufficient information in one go.")
+        lines.append("The query tendency for this round is also exploration: confirm exact candidate records, exact constraint fields, exact column names, and value domain sources. Do not stop at a vague confirmation level.")
+        lines.append("Before constructing any queries, first review the structural information already obtained in this round (e.g., DESCRIBE results).")
+        lines.append("Prefer queries that are less likely to produce errors. Only consider more complex queries after sufficient information has been obtained.")
+        lines.append("The query strategy should be to use broad queries first to obtain an overview, then gradually narrow down to determine subsequent records. Do not attempt complex JOIN queries before the data distribution is clearly understood. Do not use uncertain column names in JOIN operations.")
+        lines.append("Use only table names and column names that have been confirmed to exist. If a column does not appear in the structural information, do not assume it exists.")
+        lines.append("If a query returns an error indicating that a field does not exist, do not use that column in subsequent queries. If a query path fails due to structural mismatch, switch to other available paths.")
+        lines.append("Do not repeatedly attempt different variations on the same path—structural errors will not disappear with different syntax.")
+        lines.append("In the third round, as long as candidate records sufficient to support the final solution construction have been found, or there is sufficient evidence that the current database content cannot directly satisfy the goal, directly set completed=true.")
+        lines.append("Even if the current candidate_goal has not been completed verbatim, as long as the existing information is sufficient to serve the overall goal, sufficient to support the fourth round output, or sufficient to prove that the original candidate assumptions are invalid, you may also directly set completed=true.")
+        lines.append("Do not continue querying merely to fill in low-value background information. However, if key fields/key records that would affect the final construction are still missing, try to fill them in within the same round.")
+        lines.append("If continued queries are needed, output the necessary SQL statements, with a maximum of 5 per round. Try to obtain sufficient key exploration information in a single round.")
+        lines.append("Do not output explanatory text. Output only JSON.")
         lines.append("")
-        lines.append("总目标：")
+        lines.append("Overall goal:")
         lines.append(state.goal.summary or "<EMPTY_OVERALL_GOAL>")
         lines.append("")
-        lines.append("第三轮子目标：")
+        lines.append("Third round sub-goal:")
         lines.append(state.goal.candidate_goal or "<EMPTY_CANDIDATE_GOAL>")
         lines.append("")
         if state.goal.branch_effect:
-            lines.append("目标分支效果：")
+            lines.append("Target branch effect:")
             lines.append(state.goal.branch_effect)
             lines.append("")
         if state.goal.db_reason:
-            lines.append("需要数据库辅助的原因：")
+            lines.append("Reason for database assistance:")
             lines.append(state.goal.db_reason)
             lines.append("")
         if state.goal.relevant_symbols:
-            lines.append("关键符号：")
+            lines.append("Relevant symbols:")
             for item in state.goal.relevant_symbols:
                 lines.append("- " + item)
             lines.append("")
         if state.goal.relevant_inputs:
-            lines.append("关键外部输入：")
+            lines.append("Relevant external inputs:")
             for item in state.goal.relevant_inputs:
                 lines.append("- " + item)
             lines.append("")
         if state.goal.db_information_needs:
-            lines.append("数据库信息需求：")
+            lines.append("Database information needs:")
             for item in state.goal.db_information_needs:
                 lines.append("- " + item)
             lines.append("")
         if state.goal.db_mutation_targets:
-            lines.append("若最终需要修改数据库，可能涉及的目标项：")
+            lines.append("Database mutation targets:")
             for item in state.goal.db_mutation_targets:
                 lines.append("- " + item)
             lines.append("")
         if state.goal.candidate_stop_conditions:
-            lines.append("第三轮可停止条件：")
+            lines.append("Third round candidate stop conditions:")
             for item in state.goal.candidate_stop_conditions:
                 lines.append("- " + item)
             lines.append("")
@@ -631,27 +632,27 @@ def build_phase_prompt(phase: str, state: DBSearchState) -> str:
             lines.append(candidate_memory)
 
         lines.append("")
-        lines.append("输出 SQL 时，不需要关心数据库用户、数据库地址和数据库名，直接输出可执行的合法 SQL 语句即可。")
-        lines.append("请输出如下 JSON：")
+        lines.append("When outputting SQL, you do not need to concern yourself with database user, database address, or database name. Simply output executable and valid SQL statements directly.")
+        lines.append("Please output JSON in the following format:")
         lines.append("{")
         lines.append('  "completed": false,')
         lines.append('  "request_schema_fallback": false,')
-        lines.append('  "rationale": "本轮为何继续查询、为何完成",')
-        lines.append('  "findings": ["本轮已经确认的候选记录结论"],')
+        lines.append('  "rationale": "Why this round continues querying or why it is completed",')
+        lines.append('  "findings": ["Candidate record conclusions confirmed in this round"],')
         lines.append('  "queries": [')
         lines.append("    {")
         lines.append('      "sql": "SELECT id, username FROM users LIMIT 5;",')
-        lines.append('      "purpose": "验证候选记录是否满足目标",')
+        lines.append('      "purpose": "Verify whether candidate records satisfy the goal",')
         lines.append('      "metadata": {"kind": "candidate"}')
         lines.append("    }")
         lines.append("  ]")
         lines.append("}")
-        lines.append("如果已经达到当前轮次目标，则设置 completed=true，并让 queries 为空数组。")
+        lines.append("If the current round goal has been achieved, set completed=true and leave queries as an empty array.")
         if fallback_allowed:
-            lines.append("如果必须回退到第二轮，则设置 request_schema_fallback=true、completed=false，并让 queries 为空数组。")
+            lines.append("If a fallback to the second round is required, set request_schema_fallback=true, completed=false, and leave queries as an empty array.")
 
-        lines.append("如果还未达到当前轮次目标，则设置 completed=false，并输出 queries。")
-        lines.append("queries 最多 5 条，且都必须是只读数据库查询。")
+        lines.append("If the current round goal has not yet been achieved, set completed=false and output queries.")
+        lines.append("queries is limited to a maximum of 5 entries, and all must be read-only database queries.")
         return "\n".join(lines).rstrip() + "\n"
     if phase == PhaseName.FINALIZE:
         round_index = int(state.finalize_rounds) + 1
@@ -659,16 +660,16 @@ def build_phase_prompt(phase: str, state: DBSearchState) -> str:
         ctx = state.context if isinstance(state.context, BranchSliceContext) else BranchSliceContext()
         snapshot = ctx.input_snapshot if isinstance(ctx.input_snapshot, ExternalInputSnapshot) else ExternalInputSnapshot()
         lines = []
-        lines.append("你是数据库辅助符号执行求解器，现在处于数据库搜索组件的第四轮 finalize/output。")
-        lines.append("请你根据代码上下文，严格按照符号执行的一般流程，将目标语句和它之前所有相关条件表达式符号化，使用外部输入的表达式来表示，形成约束，并结合数据库真实状态求解。")
-        lines.append("你的任务是结合原始代码切片、完整外部输入、前面几轮压缩后的数据库信息，进行符号化分析并尝试改变目标语句的实际执行方向，并在信息足够时直接输出最终结果。")
-        lines.append("可以选择修改外部输入，或者直接修改数据库。你被允许直接向数据库插入或修改数据，INSERT、UPDATE、DELETE 都是合法手段。")
-        lines.append("你的任务是根据原始代码切片与完整外部输入，结合前面几轮得到的数据库真实信息，尝试通过修改外部输入或者修改数据库，让目标语句走向指定的目标分支。")
-        lines.append("请围绕目标语句的目标分支进行求解，不要输出解释性文字，只输出 JSON。")
+        lines.append("You are a database-assisted symbolic execution solver, now in the fourth round (finalize/output) of the database search component.")
+        lines.append("Please follow the general workflow of symbolic execution based on the code context: symbolically execute the target statement and all preceding relevant conditional expressions, represent them using external input expressions to form constraints, and solve them in conjunction with the actual database state.")
+        lines.append("Your task is to perform symbolic analysis and attempt to change the actual execution direction of the target statement, combining the raw code slice, complete external inputs, and the distilled database information from previous rounds, and directly output the final result when sufficient information is available.")
+        lines.append("You may choose to modify external inputs or directly modify the database. INSERT, UPDATE, and DELETE are all legitimate means.")
+        lines.append("Your task is to use the raw code slice, complete external inputs, and the actual database information obtained from previous rounds to make the target statement take the specified target branch, either by modifying external inputs or by modifying the database.")
+        lines.append("Focus on solving for the target branch of the target statement. Do not output explanatory text. Output only JSON.")
         if query_allowed:
-            lines.append("当前仍允许补查数据库信息；但默认策略应当是尽快输出，而不是把补查预算用满。")
-            lines.append("如果现有信息已经足以构造高置信度 solution，就直接输出最终结果，不要为了补齐低价值细节继续查询。")
-            lines.append("只有在缺少会直接影响 solution 构造的关键信息时，才进行补查。")
+            lines.append("Additional database queries are still permitted in this round; however, the default strategy should be to output as soon as possible, rather than using up the entire query budget.")
+            lines.append("If the available information is already sufficient to construct a high-confidence solution, output the final result directly. Do not continue querying merely to fill in low-value details.")
+            lines.append("Only perform supplementary queries when key information that would directly affect solution construction is still missing.")
         lines.append("")
         branch_truth = _extract_branch_truth_from_code_slice(ctx.code_slice, ctx.target_seq)
         target_truth = ""
@@ -676,14 +677,14 @@ def build_phase_prompt(phase: str, state: DBSearchState) -> str:
             target_truth = "false"
         elif branch_truth == "false":
             target_truth = "true"
-        lines.append("总目标：")
+        lines.append("Overall goal:")
         if target_truth:
-            lines.append("总目标是让第" + (str(ctx.target_seq) if ctx.target_seq is not None else "?") + "行的 if 语句取" + target_truth + "。")
+            lines.append("The overall goal is to make the if statement at line " + (str(ctx.target_seq) if ctx.target_seq is not None else "?") + " evaluate to " + target_truth + ".")
         else:
-            lines.append("总目标是让第" + (str(ctx.target_seq) if ctx.target_seq is not None else "?") + "行的 if 语句反转。")
+            lines.append("The overall goal is to reverse the if statement at line " + (str(ctx.target_seq) if ctx.target_seq is not None else "?") + ".")
         lines.append("")
         if state.goal.finalize_stop_conditions:
-            lines.append("第四轮可直接输出条件：")
+            lines.append("Conditions for direct output in the fourth round:")
             for item in state.goal.finalize_stop_conditions:
                 lines.append("- " + item)
             lines.append("")
@@ -691,44 +692,44 @@ def build_phase_prompt(phase: str, state: DBSearchState) -> str:
         if finalize_memory:
             lines.append(finalize_memory)
             lines.append("")
-        lines.append("目标分支：")
+        lines.append("Target branch:")
         lines.append("target_seq=" + (str(ctx.target_seq) if ctx.target_seq is not None else "?"))
         lines.append("target_loc=" + (ctx.target_loc or "?"))
         lines.append("")
-        lines.append("原始代码切片：")
+        lines.append("Raw code slice:")
         lines.append(ctx.code_slice.strip() or "<EMPTY_CODE_SLICE>")
         lines.append("")
         lines.append(_format_input_snapshot(snapshot))
         lines.append("")
-        lines.append("可选项：")
-        lines.append("1. 直接输出最终结果，并在 solutions 中给出最终解")
-        lines.append("2. 必须使用被禁止的SQL语句才能反转目标分支，放弃输出 solution")
+        lines.append("Options:")
+        lines.append("1. Directly output the final result, providing the final solution in solutions")
+        lines.append("2. The target branch can only be reversed using prohibited SQL statements; abandon outputting the solution")
         if query_allowed:
-            lines.append("3. 补查数据库，输出 queries")
-        lines.append("请根据需求修改PHP请求的环境变量、POST、COOKIE、GET、SESSION参数（对应 JSON 字段：ENV/POST/COOKIE/GET/SESSION）。只输出需要修改的键和值，不要把未修改的部分原样抄回 JSON。下游会基于当前输入做增量合并。")
-        lines.append("如果某个 solution 只需要修改数据库，就只输出 SQL，不要输出 SESSION/ENV/GET/POST/COOKIE。")
-        lines.append("如果某个 solution 只需要修改外部输入，就只输出对应的输入键，不要补写未修改的键。")
-        lines.append("如果需要修改数据库，请在 solution 对象中额外加入 SQL 字段。")
-        lines.append("SQL 可以是字符串，也可以是字符串数组。")
-        lines.append("如果只需要修改数据库，不需要修改外部输入，也仍然要输出一个 solution 对象；这个对象可以只有 SQL 字段。")
-        lines.append("如果既要改输入又要改数据库，就在同一个 solution 对象里同时放输入修改和 SQL。")
-        lines.append("如果某个 solution 的 SQL 会修改数据库，可以额外输出 undo_sql 字段，表示对应的抵消语句，用于后续恢复数据库。undo_sql 可以为空、字符串或字符串数组。")
-        lines.append("不要为了构造 undo_sql 进行额外数据库查询；只有在不增加任何额外查询的前提下能直接给出时才输出。")
-        lines.append("允许使用普通业务数据上的 INSERT、UPDATE、DELETE 等语句对数据库进行修改。")
-        lines.append("输出 SQL 时，不需要关心数据库用户、数据库地址和数据库名，直接输出可执行的合法 SQL 语句即可。")
-        lines.append("严禁输出任何高危数据库语句，以下语句无论出现在开头还是中间都禁止：DROP、ALTER、REVOKE、TRUNCATE、GRANT、SET GLOBAL、KILL。")
-        lines.append("严禁输出任何会影响数据库用户或权限的语句，例如：UPDATE mysql.user、DELETE FROM mysql.user、INSERT INTO mysql.user、REPLACE INTO mysql.user、CREATE USER、ALTER USER、DROP USER、RENAME USER、SET PASSWORD、GRANT ALL PRIVILEGES。")
-        lines.append("如果你认为只能通过上述高危语句才能达成目标，也不能输出它们，允许放弃输出 solution 对象。")
-        lines.append("请输出如下 JSON：")
+            lines.append("3. Perform supplementary database queries, output queries")
+        lines.append("Please modify the PHP request environment variables, POST, COOKIE, GET, and SESSION parameters as needed (corresponding JSON fields: ENV/POST/COOKIE/GET/SESSION). Output only the keys and values that need to be modified. Do not copy unmodified fields back into the JSON. Downstream will perform incremental merging based on the current inputs.")
+        lines.append("If a solution only requires database modifications, output only SQL. Do not output SESSION/ENV/GET/POST/COOKIE.")
+        lines.append("If a solution only requires external input modifications, output only the corresponding input keys. Do not include unmodified keys.")
+        lines.append("If database modifications are needed, include an additional SQL field in the solution object.")
+        lines.append("SQL can be either a string or an array of strings.")
+        lines.append("If only database modifications are needed and no external input modifications are required, still output a solution object; this object may contain only the SQL field.")
+        lines.append("If both input modifications and database modifications are needed, include both in the same solution object.")
+        lines.append("If a solution's SQL modifies the database, you may optionally include an undo_sql field with corresponding rollback statements for later database restoration. undo_sql can be empty, a string, or an array of strings.")
+        lines.append("Do not perform additional database queries solely to construct undo_sql. Only include it when it can be provided directly without any extra queries.")
+        lines.append("INSERT, UPDATE, and DELETE statements on ordinary business data are permitted for database modifications.")
+        lines.append("When outputting SQL, you do not need to concern yourself with database user, database address, or database name. Simply output executable and valid SQL statements directly.")
+        lines.append("The following high-risk SQL statements are strictly prohibited, whether they appear at the beginning or in the middle of a statement: DROP, ALTER, REVOKE, TRUNCATE, GRANT, SET GLOBAL, KILL.")
+        lines.append("The following statements that affect database users or permissions are also strictly prohibited, including but not limited to: UPDATE mysql.user, DELETE FROM mysql.user, INSERT INTO mysql.user, REPLACE INTO mysql.user, CREATE USER, ALTER USER, DROP USER, RENAME USER, SET PASSWORD, GRANT ALL PRIVILEGES.")
+        lines.append("If you believe that the goal can only be achieved through the above prohibited statements, you must still not output them. You are allowed to abandon outputting the solution object.")
+        lines.append("Please output JSON in the following format:")
         lines.append("{")
         lines.append('  "abandon": false,')
-        lines.append('  "rationale": "本轮为何补查、为何能直接输出，或为何放弃",')
-        lines.append('  "findings": ["与最终求解直接相关的结论"],')
+        lines.append('  "rationale": "Why this round performs supplementary queries, why it can output directly, or why it abandons",')
+        lines.append('  "findings": ["Conclusions directly relevant to the final solving"],')
         if query_allowed:
             lines.append('  "queries": [')
             lines.append("    {")
             lines.append('      "sql": "SELECT id, role FROM users LIMIT 5;",')
-            lines.append('      "purpose": "补查用于最终求解的数据库信息",')
+            lines.append('      "purpose": "Supplementary query for final solving",')
             lines.append('      "metadata": {"kind": "finalize_lookup"}')
             lines.append("    }")
             lines.append("  ],")
@@ -740,19 +741,19 @@ def build_phase_prompt(phase: str, state: DBSearchState) -> str:
         lines.append("    }")
         lines.append("  ]")
         lines.append("}")
-        lines.append("放弃输出示例：")
+        lines.append("Example of abandoning output:")
         lines.append("{")
         lines.append('  "abandon": true,')
-        lines.append('  "rationale": "若想反转该分支，只能依赖被禁止的高危 SQL，故放弃第四轮输出",')
-        lines.append('  "findings": ["当前可行方案都需要高危数据库语句"],')
+        lines.append('  "rationale": "Reversing this branch would require prohibited high-risk SQL statements, so fourth round output is abandoned",')
+        lines.append('  "findings": ["All feasible solutions require high-risk database statements"],')
         if query_allowed:
             lines.append('  "queries": [],')
         lines.append('  "solutions": []')
         lines.append("}")
         if query_allowed:
-            lines.append("如果还需要补查，则输出 queries；此时不要输出 solutions。")
-            lines.append("如果已经可以直接输出，则不要输出 queries，并输出至少一个 solution。")
-        lines.append("如果决定放弃，则设置 abandon=true，并且不要输出 queries、solutions、db_actions。")
+            lines.append("If supplementary queries are still needed, output queries; do not output solutions in this case.")
+            lines.append("If direct output is already possible, do not output queries and output at least one solution.")
+        lines.append("If you decide to abandon, set abandon=true and do not output queries, solutions, or db_actions.")
         return "\n".join(lines).rstrip() + "\n"
     return ""
 

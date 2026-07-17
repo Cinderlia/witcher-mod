@@ -21,7 +21,7 @@ DEFAULT_TEST_COMMAND_PATH = os.path.join("input", "test_command.txt")
 DEFAULT_URL_PATH = os.path.join("input", "url.txt")
 MAX_VISIBLE_INPUT_VALUE_LEN = 32
 HIDDEN_VALUE_PLACEHOLDER = "<HIDDEN>"
-INPUT_VALUE_MASK_NOTICE = "注意：部分参数值长度超过32个字符，已隐藏具体值，仅保留参数键。"
+INPUT_VALUE_MASK_NOTICE = "Note: Some parameter values exceed 32 characters in length. The specific values have been hidden, with only the parameter keys retained."
 _SYMEX_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
@@ -414,11 +414,11 @@ def append_standard_input_sections(
     input_value_mask_notice: str = INPUT_VALUE_MASK_NOTICE,
 ) -> None:
     flags = load_symbolic_seed_kind_flags()
-    lines.append("本次执行的环境变量是：")
+    lines.append("Environment variables for this execution:")
     if env_block:
         lines.append(env_block)
     lines.append("")
-    lines.append("本次执行的输入是：")
+    lines.append("Input for this execution:")
     lines.append(input_value_mask_notice)
     lines.append("COOKIE:" + str(cookie_block or ""))
     lines.append("GET:" + str(get_block or ""))
@@ -433,7 +433,7 @@ def append_standard_input_sections(
     disabled = [key for key in ("POST", "GET", "COOKIE", "SESSION", "ENV", "SQL", "FILE") if not bool(flags.get(key, True))]
     if disabled:
         lines.append("")
-        lines.append("额外约束：以下类型已在 symex_config.json 中被禁用，禁止修改，也不要在 solutions 中输出这些字段：" + ", ".join(disabled))
+        lines.append("Additional constraint: The following types have been disabled in symex_config.json. Do not modify them, and do not output these fields in solutions: " + ", ".join(disabled))
     lines.append("")
 
 
@@ -449,17 +449,17 @@ def append_http_input_sections(
     seed_block: str,
     input_value_mask_notice: str = INPUT_VALUE_MASK_NOTICE,
 ) -> None:
-    lines.append("本次执行的环境变量是：")
+    lines.append("Environment variables for this execution:")
     lines.append(input_value_mask_notice)
     if env_block:
         lines.append(env_block)
     if header_block:
         lines.append("")
-        lines.append("本次执行的HTTP HEADER是：")
+        lines.append("HTTP headers for this execution:")
         lines.append(header_block)
     if cookie_block or get_block or post_block:
         lines.append("")
-        lines.append("本次执行的HTTP输入是：")
+        lines.append("HTTP inputs for this execution:")
         if cookie_block:
             lines.append("COOKIE:" + str(cookie_block or ""))
         if get_block:
@@ -468,40 +468,40 @@ def append_http_input_sections(
             lines.append("POST:" + str(post_block or ""))
     if session_block:
         lines.append("")
-        lines.append("本次执行的SESSION是：")
+        lines.append("SESSION for this execution:")
         lines.append(session_block)
     if seed_block:
         lines.append("")
-        lines.append("本次Fuzz用到的种子文件是：")
+        lines.append("Seed files used for this fuzzing execution:")
         lines.append(seed_block)
     lines.append("")
 
 _DEFAULT_LLM_TAINT_TEMPLATE_TAIL = (
-    "，并以json格式输出变量名、变量类型和所在行的id（id就是每行开头的seq）。\n"
-    "type字段仅为猜测，尽量基于字面形式判断类型。\n"
-    "仅允许输出以下类型：AST_VAR、AST_PROP、AST_DIM、AST_METHOD_CALL、AST_STATIC_CALL、AST_CALL。\n"
-    "必须列出所有能够影响到{name}取值的变量和函数调用，不管是直接影响还是间接地影响。\n"
-    "还可能通过中间变量间接影响：A = B; {name} = A;\n"
-    "如果是通过中间变量间接影响，请把中间变量放入intermediates，同时把最终影响{name}的所有因素放入taints。\n"
-    "如果没有找到新的影响因素，仍然必须输出合法json，确保字段存在。\n"
-    "必须输出合法的json格式，只输出json，不要输出任何解释性文字或Markdown。\n\n"
-    "代码（每行格式为：seq + 源码行）：\n"
+    ", and output the variable names, variable types, and the line IDs (the ID is the seq at the beginning of each line) in JSON format.\n"
+    "The type field is a guess only, and should be determined based on literal form as much as possible.\n"
+    "Only the following types are allowed: AST_VAR, AST_PROP, AST_DIM, AST_METHOD_CALL, AST_STATIC_CALL, AST_CALL.\n"
+    "List all variables and function calls that can affect the value of {name}, whether directly or indirectly.\n"
+    "Indirect influence via intermediate variables is also possible: A = B; {name} = A;\n"
+    "If the influence is indirect via intermediate variables, place the intermediate variables in intermediates, and place all factors that ultimately affect {name} in taints.\n"
+    "If no new influencing factors are found, you must still output valid JSON and ensure the fields exist.\n"
+    "Must output valid JSON format. Output only JSON, do not output any explanatory text or Markdown.\n\n"
+    "Code (each line format: seq + source line):\n"
     "{result_set}\n\n"
-    "输出json格式必须为：\n"
+    "Output JSON format must be:\n"
     "{\"taints\":[{\"seq\":51529,\"type\":\"AST_VAR\",\"name\":\"negate\"}],\"intermediates\":[{\"seq\":51573,\"type\":\"AST_VAR\",\"name\":\"ret\"}]}\n"
-    "如果找不到新污点，输出：\n"
+    "If no new taints are found, output:\n"
     "{\"taints\":[],\"intermediates\":[]}\n"
 )
 
 DEFAULT_LLM_TAINT_TEMPLATE_VAR = (
-    "你是一个代码分析助手,请你找出下列代码中"
-    "所有的有可能影响到{type}变量{name}取值的变量和函数调用"
+    "You are a code analysis assistant. In the following code, identify "
+    "all variables and function calls that could affect the value of the {type} variable {name}"
     + _DEFAULT_LLM_TAINT_TEMPLATE_TAIL
 )
 
 DEFAULT_LLM_TAINT_TEMPLATE_FUNC = (
-    "你是一个代码分析助手,请你找出下列代码中"
-    "所有的有可能影响到{type}函数{name}的返回值的变量和函数调用"
+    "You are a code analysis assistant. In the following code, identify "
+    "all variables and function calls that could affect the return value of the {type} function {name}"
     + _DEFAULT_LLM_TAINT_TEMPLATE_TAIL
 )
 
@@ -510,7 +510,7 @@ DEFAULT_LLM_TAINT_TEMPLATE = DEFAULT_LLM_TAINT_TEMPLATE_VAR
 def _name_with_this_alias(tt: str, name: str) -> str:
     t = (tt or '').strip()
     v = (name or '').strip()
-    if not v or '或者' in v:
+    if not v or 'or' in v:
         return v
     if t not in ('AST_PROP', 'AST_METHOD_CALL'):
         return v
@@ -524,7 +524,7 @@ def _name_with_this_alias(tt: str, name: str) -> str:
     alt = f'this->{tail}'
     if alt == v:
         return v
-    return f'{v}或者{alt}'
+    return f'{v} or {alt}'
 
 def render_llm_taint_prompt(*, template: str, taint_type: str, taint_name: str, result_set: str) -> str:
     """Render the final prompt text for a given taint and its scoped code block."""
@@ -535,10 +535,10 @@ def render_llm_taint_prompt(*, template: str, taint_type: str, taint_name: str, 
     else:
         t = template
     if tt == 'AST_PROP':
-        t += (
-            "\n注意：代码块中可能包含展开的函数scope，范围用FUNCTION_SCOPE_START和FUNCTION_SCOPE_END标记。"
-            "\n在类方法的函数scope内，this指代当前对象本身：this->x 等价于 对象->x。"
-        )
+            t += (
+                "\nNote: The code block may contain expanded function scopes, marked with FUNCTION_SCOPE_START and FUNCTION_SCOPE_END."
+                "\nWithin a function scope of a class method, $this refers to the current object itself: $this->x is equivalent to object->x."
+            )
     name_for_prompt = _name_with_this_alias(tt, taint_name)
     prompt = (
         (t.replace('{type}', str(taint_type or ''))

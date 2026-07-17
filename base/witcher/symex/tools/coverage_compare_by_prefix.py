@@ -113,12 +113,12 @@ def _format_table(
     label_a: str,
     label_b: str,
 ) -> str:
-    header_group = "分类"
-    header_a = f"{label_a}独有"
-    header_common = "共有"
-    header_b = f"{label_b}独有"
-    header_total_a = f"{label_a}总数"
-    header_total_b = f"{label_b}总数"
+    header_group = "Category"
+    header_a = f"{label_a} Only"
+    header_common = "Shared"
+    header_b = f"{label_b} Only"
+    header_total_a = f"{label_a} Total"
+    header_total_b = f"{label_b} Total"
 
     group_width = max(len(header_group), *(len(group) for group, _, _, _, _, _ in rows)) if rows else len(header_group)
     a_width = max(len(header_a), *(len(str(a_only)) for _, a_only, _, _, _, _ in rows)) if rows else len(header_a)
@@ -162,11 +162,11 @@ def _format_summary_table(
     total_a: int,
     total_b: int,
 ) -> str:
-    header_a = f"{label_a}独有"
-    header_common = "共有"
-    header_b = f"{label_b}独有"
-    header_total_a = f"{label_a}总数"
-    header_total_b = f"{label_b}总数"
+    header_a = f"{label_a} Only"
+    header_common = "Shared"
+    header_b = f"{label_b} Only"
+    header_total_a = f"{label_a} Total"
+    header_total_b = f"{label_b} Total"
 
     sum_a_only = sum(a_only for _, a_only, _, _, _, _ in rows)
     sum_common = sum(common for _, _, common, _, _, _ in rows)
@@ -203,26 +203,26 @@ def _format_summary_table(
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="比较两个目录下所有 .cc.json 覆盖率文件，按源码路径前两级目录统计已覆盖行差异。"
+        description="Compare all .cc.json coverage files under two directories and summarize covered-line differences by the first two source-path segments."
     )
-    parser.add_argument("dir_a", help="文件夹A")
-    parser.add_argument("dir_b", help="文件夹B")
+    parser.add_argument("dir_a", help="Directory A")
+    parser.add_argument("dir_b", help="Directory B")
     parser.add_argument(
         "--output",
         default="coverage_compare_by_prefix.txt",
-        help="输出表格文件路径，默认写到当前工作目录",
+        help="Output table path. Defaults to the current working directory.",
     )
-    parser.add_argument("--label-a", default="文件夹A", help="表格中A列标题前缀")
-    parser.add_argument("--label-b", default="文件夹B", help="表格中B列标题前缀")
+    parser.add_argument("--label-a", default="Directory A", help="Prefix for column A headers in the table")
+    parser.add_argument("--label-b", default="Directory B", help="Prefix for column B headers in the table")
     args = parser.parse_args()
 
     dir_a = os.path.abspath(args.dir_a)
     dir_b = os.path.abspath(args.dir_b)
     if not os.path.isdir(dir_a):
-        print(f"目录不存在: {dir_a}")
+        print(f"Directory does not exist: {dir_a}")
         return 2
     if not os.path.isdir(dir_b):
-        print(f"目录不存在: {dir_b}")
+        print(f"Directory does not exist: {dir_b}")
         return 2
 
     output_path = args.output
@@ -245,11 +245,11 @@ def main() -> int:
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(output_text)
 
-    print(f"A目录: {dir_a}")
-    print(f"B目录: {dir_b}")
-    print(f"A覆盖率文件数: {count_a}")
-    print(f"B覆盖率文件数: {count_b}")
-    print(f"输出文件: {output_path}")
+    print(f"Directory A: {dir_a}")
+    print(f"Directory B: {dir_b}")
+    print(f"Coverage files in A: {count_a}")
+    print(f"Coverage files in B: {count_b}")
+    print(f"Output file: {output_path}")
     print("")
     print(output_text, end="")
     return 0

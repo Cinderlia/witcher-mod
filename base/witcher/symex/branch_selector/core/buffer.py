@@ -18,13 +18,6 @@ class PromptBuffer:
         self.items: List[Dict] = []
         self.tokens = 0
 
-    def can_add(self, item_text: str) -> bool:
-        return (self.tokens + estimate_tokens(item_text)) <= self.token_limit
-
-    def add(self, item: dict, item_text: str):
-        self.items.append(item)
-        self.tokens += estimate_tokens(item_text)
-
     def clear(self):
         self.items = []
         self.tokens = 0

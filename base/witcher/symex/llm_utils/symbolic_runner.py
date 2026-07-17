@@ -381,18 +381,18 @@ def _build_prompt_with_db_feedback(base_prompt: str, db_rounds: List[Dict[str, A
     prompt = (base_prompt or "").rstrip()
     if not db_rounds:
         return prompt + "\n"
-    lines: List[str] = [prompt, "", "以下是你请求并已执行的数据库查询结果（这是可能需要的数据库数据）："]
+    lines: List[str] = [prompt, "", "Below are the database query results you requested and that have been executed (this is the database data that may be needed):"]
     for i, rec in enumerate(db_rounds, 1):
         q = str((rec or {}).get("query") or "").strip()
         rs = (rec or {}).get("result")
-        lines.append(f"[数据库查询回合 {int(i)}]")
-        lines.append("查询语句：")
+        lines.append(f"[Database query round {int(i)}]")
+        lines.append("Query:")
         lines.append(q or "<EMPTY_QUERY>")
-        lines.append("查询结果（JSON）：")
+        lines.append("Query results (JSON):")
         lines.append(db_query_result_to_text(rs if isinstance(rs, dict) else {}))
         lines.append("")
-    lines.append("请严格基于上述数据库数据继续求解；只有在仍然缺少关键数据库数据时，才输出新的 DB_QUERY。")
-    lines.append("如果已有足够信息，请直接输出可用于生成新seed的 solutions JSON。")
+    lines.append("Please continue solving strictly based on the database data above. Only output a new DB_QUERY if critical database data is still missing.")
+    lines.append("If sufficient information is already available, directly output a solutions JSON that can be used to generate new seeds.")
     return "\n".join(lines).rstrip() + "\n"
 
 

@@ -90,14 +90,14 @@ def _render_scope_section(group: dict, *, index: int) -> str:
     taints_part = "\n".join(taint_lines) if taint_lines else "- <UNKNOWN>"
     block = (group.get('block') or '').rstrip()
     return (
-        f"【Scope {int(index)}】\n"
-        "请只在这个Scope里的代码中，找出会影响下面这些污点取值的变量和函数调用；不要引用其他Scope中的赋值关系。\n"
-        "污点：\n" 
-        + taints_part
-        + "\n"
-        + block
-        + "\n"
-    )
+            f"[Scope {int(index)}]\n"
+            "Within this Scope only, identify the variables and function calls that can affect the values of the following taints. Do not reference assignment relationships from other Scopes.\n"
+            "Taints:\n"
+            + taints_part
+            + "\n"
+            + block
+            + "\n"
+        )
 
 
 def build_composite_taint_prompt(scope_groups: List[dict]) -> str:
@@ -110,25 +110,25 @@ def build_composite_taint_prompt(scope_groups: List[dict]) -> str:
     except Exception:
         app_line = ""
     parts = [
-        "你是一个代码分析助手。",
+        "You are a code analysis assistant.",
     ]
     if app_line:
         parts.append(app_line)
     parts.extend([
-        "下面给出若干个Scope，每个Scope里都对应了一组污点。请分别在各自Scope内分析影响因素。",
-        "如果某个污点的影响因素不在它自己的Scope里，就不要跨Scope推断。",
-        "type字段尽量基于字面形式判断类型，仅允许：AST_VAR、AST_PROP、AST_DIM、AST_METHOD_CALL、AST_STATIC_CALL、AST_CALL。",
-        "通过中间变量间接影响时，把中间变量放入intermediates，同时把最终影响因素放入taints。",
-        "只输出合法JSON，不要输出解释或Markdown。",
+        "Multiple Scopes are provided below. Each Scope contains a set of taints. Analyze the influencing factors within each Scope independently.",
+        "If an influencing factor for a taint does not reside in its own Scope, do not infer across Scopes.",
+        "The type field should be determined based on literal form as much as possible. Only the following types are allowed: AST_VAR, AST_PROP, AST_DIM, AST_METHOD_CALL, AST_STATIC_CALL, AST_CALL.",
+        "When a taint is indirectly affected via intermediate variables, place the intermediate variables in intermediates, and place the final influencing factors in taints.",
+        "Output only valid JSON. Do not output explanatory text or Markdown.",
         "",
-        "代码（每行格式为：seq + 源码行）：",
+        "Code (each line format: seq + source line):",
         body.rstrip(),
         "",
-        "统一把所有Scope里的污点都放到taints字段里，所有中间变量都放到intermediates字段里，只输出一个JSON对象。",
+        "Place all taints from all Scopes into the taints field, and all intermediate variables into the intermediates field. Output only one JSON object.",
         "",
-        "输出JSON格式必须为：",
+        "Output JSON format must be:",
         "{\"taints\":[{\"seq\":51529,\"type\":\"AST_VAR\",\"name\":\"negate\"}],\"intermediates\":[{\"seq\":51573,\"type\":\"AST_VAR\",\"name\":\"ret\"}]}",
-        "如果找不到新污点，输出：",
+        "If no new taints are found, output:",
         "{\"taints\":[],\"intermediates\":[]}",
     ])
     return "\n".join(parts).rstrip() + "\n"

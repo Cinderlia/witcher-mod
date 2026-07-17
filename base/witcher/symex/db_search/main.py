@@ -43,8 +43,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
 
 _SPEC_LABEL_MAP = {
-    "目标代码": "code_slice",
-    "代码切片": "code_slice",
+    "target_code": "code_slice",
+    "code_slice": "code_slice",
     "code": "code_slice",
     "code_slice": "code_slice",
     "get": "get",
@@ -52,13 +52,11 @@ _SPEC_LABEL_MAP = {
     "cookie": "cookie",
     "session": "session",
     "env": "env",
-    "目标seq": "target_seq",
     "target_seq": "target_seq",
     "seq": "target_seq",
-    "目标loc": "target_loc",
     "target_loc": "target_loc",
     "loc": "target_loc",
-    "触发原因": "trigger_reason",
+    "trigger_reason": "trigger_reason",
     "trigger": "trigger_reason",
 }
 

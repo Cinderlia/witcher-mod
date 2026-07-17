@@ -254,7 +254,7 @@ def _merge_dir_into_code(code: str, dir_s: str) -> str:
     d = _format_if_direction(dir_s)
     if not d:
         return code
-    return f"{code}    # 当前分支方向: {d}"
+    return f"{code}    # Current branch direction: {d}"
 
 
 def _build_loc_to_func_impl_tags(
@@ -582,14 +582,15 @@ def generate_symbolic_execution_prompt(
         seq_display = f"{int(input_seq)}"
     else:
         seq_display = "?"
-    lines.append("你是一个专业的代码分析助手，任务是帮助Web Fuzzer发现命令注入漏洞。")
+    lines.append("You are a professional code analysis assistant. Your task is to help the Web Fuzzer discover command injection vulnerabilities.")
     lines.append("")
     lines.append(
-        "将"+ seq_display
-        + "行的命令执行语句符号化，使用外部输入的表达式来表示，形成符号执行中的约束。然后求解这些约束表达式，请修改环境变量和输入，给我一个能够破坏该命令执行语句语义结构的外部输入（环境变量、COOKIE、POST、GET、SESSION）。"
+        "Symbolically execute the command execution statement at line "
+        + seq_display
+        + ", representing it using external input expressions to form constraints for symbolic execution. Then solve these constraint expressions. Please modify environment variables and inputs to provide an external input (environment variables, COOKIE, POST, GET, SESSION) that can break the syntactic structure of the command execution statement."
     )
-    lines.append("注意：目标不是利用漏洞，而是构造输入让bash产生错误的命令，以便触发 fuzz 工具的错误检测机制。")
-    lines.append("有针对性地根据命令执行语句的语法结构，使用未闭合引号、反引号等特殊结构制造语法错误，优先使用短payload。")
+    lines.append("Note: The goal is not to exploit the vulnerability, but to construct inputs that cause bash to produce errors, thereby triggering the fuzz tool's error detection mechanism.")
+    lines.append("Target the syntactic structure of the command execution statement. Use unclosed quotes, backticks, and other special constructs to induce syntax errors. Prefer short payloads.")
     try:
         app_line = build_app_name_prompt_line(load_symex_app_config())
     except Exception:
@@ -608,7 +609,7 @@ def generate_symbolic_execution_prompt(
         seed_block=seed_block,
         input_value_mask_notice=INPUT_VALUE_MASK_NOTICE,
     )
-    lines.append("代码上下文（每行：seq | path:line | code）：")
+    lines.append("Code context (each line: seq | path:line | code):")
     try:
         from llm_utils.prompts.structured_context import structure_mapped_context
     except Exception:
@@ -695,15 +696,16 @@ def generate_symbolic_execution_prompt(
         lines.append(f"{item['seq_s']} | {item['loc']} | {item['code_s']}")
 
     lines.append("")
-    lines.append("允许使用通用工程先验（如数据库 NOT NULL、INSERT 失败条件、协议规范）来推断哪些修改“在现实系统中高度可能”影响命令执行语句的执行结果，但不允许假设具体 schema、字段长度或隐藏代码")
-    lines.append("如果有多个方案，都可以实现注入，仅输出其中一个。如果你不能确定该方案是否有效，可以输出多个方案，但需要控制方案的数量，不要随便输出很多方案。")
-    lines.append("如果能够确认决定该命令执行语句的变量不是来自上述五种输入（环境变量、COOKIE、POST、GET、SESSION），则认为无法修改。")
-    lines.append("如果缺少部分信息，尽量根据代码中的变量名和你的工程先验执行推断外部输入的格式，生成一些可能的输入值。仅在确定没有其他信息可以推断时，才输出空json。")
-    lines.append("只输出需要修改的键和值，不要把未修改的 ENV/COOKIE/POST/GET/SESSION 原样抄回 JSON；下游会基于当前输入做增量合并。")
-    lines.append("只输出JSON，不要输出任何解释性文字或Markdown。")
-    lines.append("如果需要修改SESSION参数，请在JSON的 SESSION 字段中输出你想修改的 session 键值对，使用 JSON 对象表示。不要输出完整 session 文件内容；下游会基于当前 SESSION 和这些修改自动生成合法的 session 文件。")
-    lines.append(f"如果你想删除某个已有键，而不是把它设为 null 或空串，请把该键的值设置为严格等于 {DELETE_KEY_SENTINEL} 的字符串。这个约定同样适用于 ENV/POST/COOKIE/GET/SESSION。")
-    lines.append("请输出一个JSON文件，示例：")
+    lines.append("General engineering priors (e.g., database NOT NULL, INSERT failure conditions, protocol specifications) may be used to infer which modifications are 'highly likely' to affect command execution outcomes in real-world systems. However, do not assume specific schemas, field lengths, or hidden code.")
+    lines.append("If the exact format of a parameter name cannot be determined, generate all possible parameter formats based on prior knowledge.")
+    lines.append("If multiple approaches can achieve the inversion, output only one of them. If you are unsure whether a given approach is valid, you may output multiple approaches.")
+    lines.append("If you can confirm that the variable determining this command execution statement does not come from any of the above five input types (environment variables, COOKIE, POST, GET, SESSION), then treat it as unmodifiable.")
+    lines.append("If some information is missing, infer possible input formats based on variable names in the code and your engineering priors, and generate some plausible input values. Only output an empty JSON when you are certain that no further information can be inferred.")
+    lines.append("Output only the keys and values that need to be modified. Do not copy unmodified ENV/COOKIE/POST/GET/SESSION fields back into the JSON; downstream will perform incremental merging based on the current inputs.")
+    lines.append("Output only JSON. Do not output any explanatory text or Markdown.")
+    lines.append("If SESSION parameters need to be modified, output the session key-value pairs in the SESSION field of the JSON, using a JSON object. Do not output the full session file content; downstream will automatically generate a valid session file based on the current SESSION and your modifications.")
+    lines.append(f"If you wish to delete an existing key rather than setting it to null or an empty string, set the value of that key to a string strictly equal to {DELETE_KEY_SENTINEL}. This convention applies equally to ENV/POST/COOKIE/GET/SESSION.")
+    lines.append("Please output a JSON file. Example:")
     lines.append("{")
     lines.append('  "solutions": [')
     lines.append("    {")

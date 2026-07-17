@@ -40,13 +40,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         description="Scan archived symbolic prompts, call the configured LLM, and count external-input source categories."
     )
     cwd = os.getcwd()
-    parser.add_argument("--app-name", default="", help="应用名，默认留空")
-    parser.add_argument("--input-dir", default=cwd, help="输入目录，默认当前工作目录")
-    parser.add_argument("--output-dir", default=cwd, help="输出目录，默认当前工作目录")
-    parser.add_argument("--buffer-token-limit", type=int, default=3000, help="单个缓冲区的估算 token 上限，默认 3000")
-    parser.add_argument("--buffer-count", type=int, default=5, help="缓冲区数量，也是最大并发批次数，默认 5")
-    parser.add_argument("--extractor-workers", type=int, default=2, help="prompt 提取 worker 数量，默认 2")
-    parser.add_argument("--llm-config", default="", help="可选的 LLM 配置文件路径")
+    parser.add_argument("--app-name", default="", help="Application name. Defaults to empty.")
+    parser.add_argument("--input-dir", default=cwd, help="Input directory. Defaults to the current working directory.")
+    parser.add_argument("--output-dir", default=cwd, help="Output directory. Defaults to the current working directory.")
+    parser.add_argument("--buffer-token-limit", type=int, default=3000, help="Estimated token limit for a single buffer. Defaults to 3000.")
+    parser.add_argument("--buffer-count", type=int, default=5, help="Number of buffers, also the maximum number of concurrent batches. Defaults to 5.")
+    parser.add_argument("--extractor-workers", type=int, default=2, help="Number of prompt extraction workers. Defaults to 2.")
+    parser.add_argument("--llm-config", default="", help="Optional path to the LLM configuration file.")
     return parser
 
 
